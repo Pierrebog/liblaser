@@ -1,0 +1,6 @@
+[submodule "contrib/libusb"]
+	path = contrib/libusb
+	url = git@github.com:libusb/libusb.git
+[submodule "contrib/libudfread"]
+	path = contrib/libudfread
+	url = https://code.videolan.org/videolan/libudfread.git
