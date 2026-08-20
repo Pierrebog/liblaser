@@ -24,37 +24,36 @@
  * See laser.h for the full contract. Summary of what happens
  * here: an unseen token, the first time laser_acquire() is called on it,
  * gets registered - treated as an already
- * permission-granted fd (obtained by the Kotlin side via Android's
- * UsbManager, which is the only thing on the whole system allowed to open a
- * raw device path under /dev/bus/usb for an unprivileged app) - and wrapped
+ * permission-granted fd - on Android, the one obtained through UsbManager,
+ * which is the only thing on that system allowed to open a raw device path
+ * under /dev/bus/usb for an unprivileged app - and wrapped
  * with a dedicated libusb context, ready for SCSI-MMC transactions via bot.c
  * and scsi.c.
  *
  * REGISTRATION HANGS OFF THE CLAIM, and off nothing else. laser_register()
  * below is static and reachable only from laser_acquire(); every other entry
- * point of this library looks a token up and fails if it is not there.
- * Commands used to register a device lazily, which was convenient and left a
- * hole: a registration created that way was claimed by nobody, and since
- * teardown only ever happened on the 1 -> 0 transition of the claim count,
- * nothing could ever destroy it. It held a libusb handle and one of
- * LASER_MAX_DEVICES slots for the life of the process, and - once the Kotlin
- * side closed the descriptor underneath it and the OS recycled that number -
- * could be handed out for a completely different device.
+ * point of this library looks a token up and fails if it is not there. A
+ * device registered without a claim would be one nothing could destroy, since
+ * teardown only ever happens on the 1 -> 0 transition of the claim count: it
+ * would hold a libusb handle and one of LASER_MAX_DEVICES slots for the life
+ * of the process, and once its owner closed the descriptor underneath it and
+ * the OS recycled that number, it could be handed out for a completely
+ * different device.
  *
- * Every consumer in this project already acquires before it does anything
- * (the laser access module in both its Open paths, cdrom.c in ioctl_Open(),
- * libdvdcss in dvdcss_open()), so removing the lazy path cost no call site
- * anything. What it removed was a state - registered but unclaimed - that
- * nothing could get out of.
+ * Every consumer in this project acquires before it does anything - the laser
+ * access module in both its Open paths, cdrom.c in ioctl_Open(), libdvdcss in
+ * dvdcss_open().
  *****************************************************************************/
 
 #include <errno.h>
 #include <stdarg.h>
-#include <sys/stat.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <android/log.h>
+
+#ifdef __ANDROID__
+# include <android/log.h>
+#endif
 
 #include "laser.h"
 #include "laser_internal.h"
@@ -105,11 +104,22 @@
 static laser_log_cb_t g_log_cb;
 static void          *g_log_opaque;
 
+/* Where a line goes when no consumer has installed a sink of its own.
+ *
+ * PER PLATFORM, AND ONLY HERE. This is the one place in the library that
+ * knows what operating system it is running on: everything above it deals in
+ * libusb, SCSI and file descriptors, none of which need to know. A consumer
+ * that wants its own sink calls laser_set_log_cb() and this is never reached.
+ *
+ * "%s" and not msg directly, in both branches: the message has already been
+ * formatted, and anything in it that looks like a conversion is data by then
+ * - a volume label, a device string. */
 static void default_log_cb(void *opaque, laser_log_level_t level,
                            const char *msg)
 {
     (void) opaque;
 
+#ifdef __ANDROID__
     int prio;
     switch (level) {
     case LASER_LOG_ERROR: prio = ANDROID_LOG_ERROR; break;
@@ -117,10 +127,20 @@ static void default_log_cb(void *opaque, laser_log_level_t level,
     default:              prio = ANDROID_LOG_INFO;  break;
     }
 
-    /* "%s" and not msg directly: the message has already been formatted, and
-     * anything in it that looks like a conversion is data by then - a volume
-     * label, a device string. */
     __android_log_print(prio, LOG_TAG, "%s", msg);
+#else
+    const char *prio;
+    switch (level) {
+    case LASER_LOG_ERROR: prio = "E"; break;
+    case LASER_LOG_WARN:  prio = "W"; break;
+    default:              prio = "I"; break;
+    }
+
+    /* stderr rather than stdout: a library has no claim on a program's
+     * output, and a diagnostic that ends up piped into a consumer's data is
+     * worse than one nobody reads. */
+    fprintf(stderr, "%s/%s: %s\n", prio, LOG_TAG, msg);
+#endif
 }
 
 void laser_set_log_cb(laser_log_cb_t cb, void *opaque)
@@ -159,6 +179,10 @@ laser_entry_t *laser_lookup(int token)
 
     pthread_mutex_lock(&g_table_lock);
     for (int i = 0; i < LASER_MAX_DEVICES; i++) {
+        /* `in_use` alone is enough: registration publishes it LAST, so a
+         * half-built entry - one whose ctx, handle and endpoints are not yet
+         * filled in, which lasts seconds - is not in the table to be found.
+         * See the field's doc comment in laser_internal.h. */
         if (g_entries[i].in_use && g_entries[i].token == token) {
             found = &g_entries[i];
             break;
@@ -239,12 +263,12 @@ static laser_entry_t *reserve_slot(int fd)
  *
  * The memset is what frees the slot - in_use, token and every field behind
  * them go to zero together, which is also what reserve_slot() relies on when
- * it hands the slot back out. An explicit `slot->in_use = 0` used to follow
- * it; it restated one byte the memset had already written and read as though
+ * it hands the slot back out. No explicit `slot->in_use = 0` follows: it
+ * would restate one byte the memset has already written, and read as though
  * the memset were incomplete.
  *
  * Also used by teardown, which is why it is not named after the failure
- * path it was written for. */
+ * path. */
 static void release_slot(laser_entry_t *slot)
 {
     pthread_mutex_lock(&g_table_lock);
@@ -262,41 +286,6 @@ static void release_slot(laser_entry_t *slot)
  * laser.h), so this only takes one parameter.
  *
  * Caller MUST hold g_registry_lock. */
-/* Record what `fd` currently points at. Never fails in a way the caller has to
- * handle: an fstat() that does not work leaves the identity marked invalid,
- * which fd_id_same() then treats as "cannot tell", and registration proceeds
- * exactly as it did before this check existed. */
-static void fd_id_take(int fd, laser_fd_id_t *out)
-{
-    struct stat st;
-
-    if (fstat(fd, &st) != 0) {
-        out->valid = 0;
-        return;
-    }
-
-    out->valid = 1;
-    out->dev   = st.st_dev;
-    out->ino   = st.st_ino;
-    out->rdev  = st.st_rdev;
-}
-
-/* Do these two identities describe the same open file description?
- *
- * TRUE WHEN EITHER SIDE IS UNKNOWN, deliberately. This answer decides whether
- * an existing registration may be reused, and the cost of the two mistakes is
- * not symmetric: reusing a stale entry addresses the wrong device, but
- * discarding a good one tears down a working drive under whoever is still
- * using it. On no evidence, the existing entry is kept - which is what this
- * function returning true means. */
-static int fd_id_same(const laser_fd_id_t *a, const laser_fd_id_t *b)
-{
-    if (!a->valid || !b->valid)
-        return 1;
-
-    return a->dev == b->dev && a->ino == b->ino && a->rdev == b->rdev;
-}
-
 static int laser_register(int fd)
 {
     laser_entry_t *entry = reserve_slot(fd);
@@ -305,9 +294,10 @@ static int laser_register(int fd)
         return -1;
     }
 
-    /* Taken before anything else touches the descriptor, so that what is
-     * recorded is what this registration was actually built on. */
-    fd_id_take(fd, &entry->fd_id);
+    /* Full size until something proves otherwise. The slot was memset by
+     * reserve_slot(), so this cannot be left to the zero: a cap of 0 would
+     * clamp every chunk to a single block. */
+    entry->max_transfer_bytes = LASER_MAX_BYTES_PER_TRANSFER;
 
     if (pthread_mutex_init(&entry->io_lock, NULL) != 0) {
         LOGE("register(fd=%d): pthread_mutex_init(io_lock) failed", fd);
@@ -353,17 +343,18 @@ static int laser_register(int fd)
      * laser_entry_t::ctx for why this must not be the shared/NULL
      * default context.
      *
-     * NO_DEVICE_DISCOVERY is not optional on Android: an unprivileged app
-     * cannot read /dev/bus/usb, so libusb's normal enumeration at init
-     * has nothing it is allowed to look at. Depending on the version it
-     * either fails outright or spends the attempt walking a directory it
-     * cannot open. The supported arrangement is exactly the one this file
-     * uses - no discovery, and a device obtained solely by wrapping an
-     * fd the Android framework already opened for us
+     * NO_DEVICE_DISCOVERY, because this library never enumerates: it is
+     * given a descriptor and works from that. On a system where the caller
+     * cannot read /dev/bus/usb - Android, for an unprivileged app - libusb's
+     * normal enumeration at init has nothing it is allowed to look at, and
+     * depending on the version either fails outright or spends the attempt
+     * walking a directory it cannot open. The supported arrangement is
+     * exactly the one this file uses: no discovery, and a device obtained
+     * solely by wrapping a descriptor its owner already opened
      * (libusb_wrap_sys_device below).
      *
      * Consequence worth stating: this context can never enumerate or
-     * hotplug-notify. Neither is wanted here - Kotlin owns device
+     * hotplug-notify. Neither is wanted here - the caller owns device
      * attach/detach through UsbManager and drives open/close explicitly -
      * but it does mean libusb's hotplug machinery is dead weight in this
      * build. */
@@ -409,10 +400,10 @@ static int laser_register(int fd)
 
     /* Interface selection comes FIRST, before anything is claimed: which
      * interface to claim is its result, not its precondition. Reading the
-     * configuration descriptor requires no claim, and claiming interface
-     * 0 up front - as this function used to - is exactly the assumption
-     * that breaks on a device whose mass-storage function is not listed
-     * first. See laser_find_bulk_endpoints() for the full rationale. */
+     * configuration descriptor requires no claim, and claiming interface 0
+     * up front would be exactly the assumption that breaks on a device whose
+     * mass-storage function is not listed first. See
+     * laser_find_bulk_endpoints() for the full rationale. */
     if (laser_find_bulk_endpoints(entry) < 0) {
         LOGW("register(fd=%d, usb %04x:%04x bcd %04x): no usable Bulk-Only "
              "mass storage interface - not an optical drive?",
@@ -443,9 +434,9 @@ static int laser_register(int fd)
      * come after the reset and after io_lock exists, since it takes it.
      * Always leaves entry->lun usable, even on failure.
      *
-     * ONE CALL ANSWERING BOTH, where there used to be two: choosing the unit
-     * and classifying it were separate functions, and the second re-issued
-     * the very INQUIRY the first had made its choice on.
+     * ONE CALL ANSWERING BOTH: choosing the unit and classifying it are the
+     * same question asked once, and splitting them would mean re-issuing the
+     * very INQUIRY the choice was made on.
      *
      * Combo enclosures expose their card reader as a second Mass Storage /
      * Bulk-Only / SCSI device, identical to a drive in every USB descriptor,
@@ -463,6 +454,20 @@ static int laser_register(int fd)
         LOGI("register(fd=%d, usb %04x:%04x): not an optical drive, "
              "declining", fd, entry->vid, entry->pid);
         ret = LIBUSB_ERROR_NOT_SUPPORTED;
+        goto err_iface;
+    }
+
+    /* The device left the bus while we were probing it. Declining is the only
+     * honest answer: every field this entry would carry - endpoints, LUN,
+     * interface - describes something that is no longer there, and publishing
+     * it means each consumer that looks the token up pays a failed transfer
+     * to discover what is already known here. The same drive plugged back in
+     * arrives as a new descriptor and a new token, so there is nothing to
+     * keep this one for. */
+    if (optical == LASER_OPTICAL_GONE) {
+        LOGW("register(fd=%d, usb %04x:%04x): device left the bus during "
+             "setup, declining", fd, entry->vid, entry->pid);
+        ret = LIBUSB_ERROR_NO_DEVICE;
         goto err_iface;
     }
 
@@ -488,9 +493,9 @@ static int laser_register(int fd)
 
     /* Publish. Everything this entry needs is now in place, so from here
      * laser_lookup() may hand it out - and not one line before, which is the
-     * whole reason this single write can do the job `ready` used to. Done
-     * under the table lock so that a thread which observes in_use == 1 also
-     * observes every field written above it. */
+     * whole reason a single flag is enough. Done under the table lock so that
+     * a thread which observes in_use == 1 also observes every field written
+     * above it. */
     pthread_mutex_lock(&g_table_lock);
     entry->in_use = 1;
     pthread_mutex_unlock(&g_table_lock);
@@ -549,7 +554,10 @@ static int laser_register(int fd)
  * sequence took this lock, dropped it, and took it again to count, and a
  * release landing in that gap could tear the entry down between the two
  * halves. The caller then incremented refs on a slot that had just been
- * memset - or, worse, one already handed to a different fd. */
+ * memset - or, worse, one already handed to a different fd.
+ *
+ * Renamed from g_registry_lock along with the removal of the lazy path
+ * it was named for. */
 static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---------------------------------------------------------------------------
@@ -763,54 +771,14 @@ laser_status_t laser_acquire(int token)
 {
     /* ONE CRITICAL SECTION, covering the lookup, the registration if there
      * has to be one, and the increment. Not an optimisation - a correctness
-     * requirement. This used to call a lookup-or-register helper that took
-     * this lock and gave it back, then re-took it to count; a release landing
-     * in that gap could take another consumer's claim to zero and tear the
-     * entry down between the two halves, after which this function
-     * incremented refs on a slot that had just been memset, or on one already
-     * reserved for a different fd. */
+     * requirement. Dropping the lock between the lookup and the increment
+     * would let a release land in the gap, take another consumer's claim to
+     * zero and tear the entry down between the two halves, leaving this
+     * function to increment refs on a slot that had just been memset, or on
+     * one already reserved for a different fd. */
     pthread_mutex_lock(&g_registry_lock);
 
     laser_entry_t *entry = laser_lookup(token);
-
-    if (entry != NULL) {
-        /* An entry under this number is not proof that it describes the
-         * descriptor being handed over now. The operating system reuses
-         * descriptor numbers, and an entry outlives its device whenever a
-         * consumer fails to release its claim: the Kotlin side then closes the
-         * connection, the number comes back for the next drive plugged in, and
-         * this lookup answers with a registration built on a descriptor that
-         * no longer exists. Every command would go to a libusb handle wrapping
-         * it, which is a wrong answer rather than a missing one.
-         *
-         * THE ONLY PLACE THIS CAN BE CHECKED USEFULLY. A recycled number can
-         * only appear where a NEW session begins, which is here: while a claim
-         * is legitimately held the Kotlin side has not closed anything, so
-         * there is nothing to recycle. Checking on every lookup instead would
-         * put an fstat() on the transaction path and, worse, leave
-         * laser_lookup() with no way to act on a mismatch - it holds only the
-         * table lock, and tearing an entry down needs the registry lock this
-         * function is already inside.
-         *
-         * Cancelled before teardown, exactly as laser_release() does at the
-         * 1 -> 0 transition: the consumer that leaked its claim may still be
-         * inside a command, and the flag is what lets it give up at its next
-         * checkpoint rather than run out a full retry budget against a handle
-         * that is about to close. */
-        laser_fd_id_t now;
-        fd_id_take(token, &now);
-
-        if (!fd_id_same(&entry->fd_id, &now)) {
-            LOGW("acquire(token=%d, usb %04x:%04x): the descriptor no longer "
-                 "refers to the registered device - it has been recycled; "
-                 "dropping the stale registration",
-                 token, entry->vid, entry->pid);
-            laser_set_cancelled(entry);
-            teardown_entry_locked(entry);
-            entry = NULL;
-        }
-    }
-
     if (entry == NULL) {
         /* Result checked via the lookup rather than the return value: what
          * matters to this function is whether an entry exists afterwards, and
@@ -874,10 +842,23 @@ void laser_release(int token)
     }
 
     /* Last claim gone: this device is on its way out. Raise the cancellation
-     * flag BEFORE tearing anything down. */
+     * flag BEFORE tearing anything down.
+     *
+     * THIS IS WHERE CANCELLATION LIVES, and not in an entry point a consumer
+     * could call. The flag is sticky and token-wide, while a claim is one of
+     * several: on a DVD libdvdcss holds the same token, so one consumer
+     * cancelling would disable the drive for the others with no way to clear
+     * it. Arriving here means "the last consumer is done", which is the only
+     * moment at which a token-wide statement is true.
+     *
+     * What it buys, set from here: the public contract says no
+     * transaction may be in flight when the last claim is dropped, and
+     * nothing here can enforce that. A thread that legitimately took its
+     * entry pointer before this call began now sees the flag and abandons its
+     * remaining attempts, instead of spending a six-attempt budget on a
+     * handle that is about to close. */
     laser_set_cancelled(entry);
 
     teardown_entry_locked(entry);
     pthread_mutex_unlock(&g_registry_lock);
 }
-

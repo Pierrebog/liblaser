@@ -143,21 +143,18 @@
  * Minutes is not merely slow, it is a hang: this runs inside
  * laser_register(), which holds the registry lock
  * for its whole duration - so a teardown blocks behind
- * it, and the Kotlin side cannot cancel it either, since classify()
- * awaits a non-interruptible withContext(IO).
+ * it, and the caller cannot cancel it either, since registration runs to
+ * completion once started.
  *
  * 15s leaves clear headroom over the ~10s the nominal path spends, so
  * this never fires on a merely slow drive, while capping the pathological
  * one at something a user experiences as a pause rather than a freeze. */
 #define LASER_SPINUP_MAX_WALL_MS   15000
 
-/* Safe upper bound on the data phase of a single BOT transaction. Well
- * under the SCSI READ(10) 16-bit block-count field's own limit (65535
- * blocks) - this cap exists to stay comfortably inside USB bulk transfer
- * sizes that are reliable in practice across Android USB host controller
- * implementations, not because of a SCSI-level limit. */
-#define LASER_MAX_BYTES_PER_TRANSFER  (64 * 1024)
-/* GET MAX LUN: Bulk-Only class request, Device-to-Host, returns one byte
+/* LASER_MAX_BYTES_PER_TRANSFER and LASER_MIN_BYTES_PER_TRANSFER are in
+ * laser_internal.h: they bound laser_entry_t::max_transfer_bytes, which
+ * registry.c initialises, so they belong with that field.
+ * GET MAX LUN: Bulk-Only class request, Device-to-Host, returns one byte
  * holding the number of the LAST logical unit (so 0 means "one LUN"). A
  * device that does not support multiple LUNs is required to stall it. */
 #define USB_BOT_GETMAXLUN_bREQUEST      0xFE
@@ -184,12 +181,12 @@
  * the classification probe this transport grew out of. */
 #define SCSI_INQUIRY_ALLOC_LEN  36
 
-/** Forward declaration: defined further down, but the spin-up wait below
- * needs it to interpret a TEST UNIT READY failure. */
+/* Forward declaration: defined further down, but the spin-up wait below
+ * ,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,needs it to interpret a TEST UNIT READY failure. */
 static int request_sense_locked(laser_entry_t *entry,
                                 uint8_t *sense_key, uint8_t *asc, uint8_t *ascq);
 
-/** SCSI TEST UNIT READY (opcode 0x00): no data phase, the CSW status
+/* SCSI TEST UNIT READY (opcode 0x00): no data phase, the CSW status
  * alone says whether the unit is ready.
  *
  * Returns laser_bot_send_locked()'s code verbatim rather than
@@ -208,7 +205,7 @@ static int test_unit_ready_locked(laser_entry_t *entry)
                                    NULL, 0, 0, NULL, &csw_status);
 }
 
-/** Milliseconds elapsed on CLOCK_MONOTONIC since *start. Monotonic
+/* Milliseconds elapsed on CLOCK_MONOTONIC since *start. Monotonic
  * specifically: a wall-clock budget must not be lengthened or cut short
  * by the system clock being stepped, which on Android happens routinely
  * as NTP and the carrier's time settle after a boot or a network change. */
@@ -220,7 +217,42 @@ static long monotonic_ms_since(const struct timespec *start)
            + (now.tv_nsec - start->tv_nsec) / 1000000L;
 }
 
-/** GET EVENT STATUS NOTIFICATION (opcode 4Ah), media event class, polled.
+/* Wake the drive and wait for its medium to become ready before any read
+ * is attempted.
+ *
+ * This is the single most important thing the POC did that the module
+ * initially did not: an optical drive that has spun its disc down (or
+ * never spun it up since the disc was inserted) answers the very first
+ * data-bearing command with NOT READY / becoming-ready, and - depending
+ * on firmware - a READ that arrives cold may fail outright rather than
+ * kick off the spin-up. A TEST UNIT READY is the command whose whole
+ * purpose is to prod the unit and report its state; issuing it in a loop
+ * both starts the mechanical spin-up and waits for it to finish.
+ *
+ * Mechanical spin-up of a cold DVD can take well over the transport's
+ * ordinary per-command retry budget - several seconds, sometimes more
+ * than ten - so this has its own, longer budget, separate from
+ * LASER_MAX_RETRIES. That budget has two independent ceilings, and
+ * whichever is reached first ends the wait:
+ *
+ *   - LASER_SPINUP_MAX_ATTEMPTS, which bounds how many times a
+ *     drive that keeps answering "not yet" is asked again;
+ *   - LASER_SPINUP_MAX_WALL_MS, which bounds the real time spent,
+ *     and is what stops a drive that has stopped answering from turning
+ *     the attempt budget into minutes of USB timeouts (see that
+ *     constant's own comment - this function runs with the registry
+ *     lock held, so those minutes block teardown too).
+ *
+ * Two conditions end it earlier still, because neither can be improved
+ * on by waiting: MEDIUM NOT PRESENT, there being no disc; and the device
+ * having left the bus altogether, which TEST UNIT READY now reports
+ * distinctly rather than as one more "not ready".
+ *
+ * Best-effort: a drive that never reports ready still falls through to
+ * the caller, which will find out soon enough when its first real read
+ * fails. Runs on LUN 0 (entry->lun before discovery); that is enough to
+ * spin the mechanism up, and LUN discovery's own INQUIRY follows. */
+/* GET EVENT STATUS NOTIFICATION (opcode 4Ah), media event class, polled.
  * Purely diagnostic: it changes nothing, it only reports what the drive
  * believes about the tray and the medium.
  *
@@ -274,40 +306,6 @@ static void log_media_status_locked(laser_entry_t *entry)
          no_event, class, buf[2], buf[3], buf[4], buf[5]);
 }
 
-/** Wake the drive and wait for its medium to become ready before any read
- * is attempted.
- *
- * An optical drive that has spun its disc down (or
- * never spun it up since the disc was inserted) answers the very first
- * data-bearing command with NOT READY / becoming-ready, and - depending
- * on firmware - a READ that arrives cold may fail outright rather than
- * kick off the spin-up. A TEST UNIT READY is the command whose whole
- * purpose is to prod the unit and report its state; issuing it in a loop
- * both starts the mechanical spin-up and waits for it to finish.
- *
- * Mechanical spin-up of a cold DVD can take well over the transport's
- * ordinary per-command retry budget - several seconds, sometimes more
- * than ten - so this has its own, longer budget, separate from
- * LASER_MAX_RETRIES. That budget has two independent ceilings, and
- * whichever is reached first ends the wait:
- *
- *   - LASER_SPINUP_MAX_ATTEMPTS, which bounds how many times a
- *     drive that keeps answering "not yet" is asked again;
- *   - LASER_SPINUP_MAX_WALL_MS, which bounds the real time spent,
- *     and is what stops a drive that has stopped answering from turning
- *     the attempt budget into minutes of USB timeouts (see that
- *     constant's own comment - this function runs with the registry
- *     lock held, so those minutes block teardown too).
- *
- * Two conditions end it earlier still, because neither can be improved
- * on by waiting: MEDIUM NOT PRESENT, there being no disc; and the device
- * having left the bus altogether, which TEST UNIT READY now reports
- * distinctly rather than as one more "not ready".
- *
- * Best-effort: a drive that never reports ready still falls through to
- * the caller, which will find out soon enough when its first real read
- * fails. Runs on LUN 0 (entry->lun before discovery); that is enough to
- * spin the mechanism up, and LUN discovery's own INQUIRY follows. */
 void laser_wait_until_ready(laser_entry_t *entry)
 {
     struct timespec started;
@@ -315,6 +313,12 @@ void laser_wait_until_ready(laser_entry_t *entry)
 
     pthread_mutex_lock(&entry->io_lock);
 
+    /* NOT CANCELLABLE, and it cannot be: this runs inside laser_acquire(),
+     * under g_registry_lock, on an entry that has not been published yet - so
+     * nothing can look the token up, and cancellation is set only by the
+     * laser_release() that would have to take that same lock to get here.
+     *
+     * What bounds it is LASER_SPINUP_MAX_WALL_MS, checked below. */
     for (int attempt = 1; attempt <= LASER_SPINUP_MAX_ATTEMPTS; attempt++) {
         int rc = test_unit_ready_locked(entry);
 
@@ -392,15 +396,12 @@ void laser_wait_until_ready(laser_entry_t *entry)
     pthread_mutex_unlock(&entry->io_lock);
 }
 
-/** One INQUIRY on the unit currently selected by entry->lun.
+/* One INQUIRY on the unit currently selected by entry->lun.
  *
- * UNDER THE PROBE TIMEOUTS, always. This is the whole reason the two probes
- * that used to exist are now one function: the LUN scan issued this exact
- * command at the READ timeouts, so a multi-LUN device with an absent unit
- * could spend eleven seconds per LUN inside registration, with the registry
- * lock held - while the classification probe ten lines further down set
- * entry->probe_timeouts around the identical command precisely so it would
- * not.
+ * UNDER THE PROBE TIMEOUTS, always, and that is why selecting the unit and
+ * classifying it are one function rather than two. At the READ timeouts a
+ * multi-LUN device with an absent unit spends eleven seconds per LUN inside
+ * registration, with the registry lock held.
  *
  * @param pdt receives the peripheral device type on success.
  * @return 0 on success, BOT_FAIL_NO_DEVICE if the device is gone, -1 if the
@@ -493,7 +494,9 @@ int laser_probe_lun(laser_entry_t *entry)
 
         if (rc == BOT_FAIL_NO_DEVICE) {
             entry->lun = 0;
-            return LASER_OPTICAL_NO_ANSWER;
+            LOGW("token=%d: device left the bus during the LUN probe",
+                 entry->token);
+            return LASER_OPTICAL_GONE;
         }
         if (rc != 0)
             continue; /* Unit absent or unhappy; try the next one. */
@@ -555,7 +558,7 @@ int laser_probe_lun(laser_entry_t *entry)
     return LASER_OPTICAL_YES;
 }
 
-/** REQUEST SENSE (opcode 0x03) - decode the reason for the previous CHECK
+/* REQUEST SENSE (opcode 0x03) - decode the reason for the previous CHECK
  * CONDITION. Caller MUST already hold entry->io_lock. */
 static int request_sense_locked(laser_entry_t *entry,
                                 uint8_t *sense_key, uint8_t *asc, uint8_t *ascq)
@@ -625,6 +628,19 @@ laser_status_t laser_scsi_cdb(int token,
              token, data_len, LASER_MAX_BYTES_PER_TRANSFER);
     }
 
+    /* lookup(), and NOT a lookup-or-register. A command on an unclaimed token
+     * answers exactly as one on a token that was never valid: NO_SUCH_TOKEN,
+     * immediately, with nothing set up.
+     *
+     * Registering here instead would leave no way back. The registration
+     * would belong to nobody, teardown only ever happens when a claim count
+     * falls to zero, and a count never incremented never falls: the entry
+     * would hold a libusb handle and a table slot until the process died, and
+     * once its owner closed the descriptor and the OS recycled the number,
+     * that stale entry would answer for a different device. Every
+     * consumer in this project calls laser_acquire() first - the access
+     * module in both Open paths, cdrom.c in ioctl_Open(), libdvdcss in
+     * dvdcss_open() - so what this catches is a caller that forgets. */
     laser_entry_t *entry = laser_lookup(token);
     if (entry == NULL) {
         LOGW("token=%d: no such token - is a claim held? "
@@ -672,6 +688,13 @@ laser_status_t laser_scsi_cdb(int token,
         return LASER_ERR_CANCELLED;
     }
 
+    /* Already known to be gone. Answered here, before io_lock and before
+     * libusb, because everything below this point would spend the whole retry
+     * budget rediscovering it - see laser_entry_t::device_gone. */
+    if (entry->device_gone) {
+        return LASER_ERR_NO_DEVICE;
+    }
+
     pthread_mutex_lock(&entry->io_lock);
 
     laser_status_t result = LASER_ERR_IO;
@@ -694,12 +717,11 @@ laser_status_t laser_scsi_cdb(int token,
      * right thing here is to report the failure and let the CSS code
      * above decide, rather than blindly re-sending.
      *
-     * CORRECTION, and the reason this is no longer keyed on direction: three
-     * of that state machine's five steps (request AGID, report key1, report
-     * drive challenge) are REPORT KEY, i.e. DATA-IN, and were therefore marked
-     * retryable by the line below - two lines under a comment correctly
-     * enumerating the state machine they belong to. The worst case was not
-     * desynchronisation but EXHAUSTION: REPORT KEY format 00h is DATA-IN with
+     * NOT KEYED ON DIRECTION, which is the trap here: three of that state
+     * machine's five steps (request AGID, report key1, report drive
+     * challenge) are REPORT KEY, i.e. DATA-IN, so a direction test would mark
+     * them retryable. The worst case is not desynchronisation but
+     * EXHAUSTION: REPORT KEY format 00h is DATA-IN with
      * an 8-byte data phase, and every accepted one ALLOCATES one of the
      * drive's four AGIDs, so a single call retried through a UNIT ATTENTION
      * could consume all four and leave the drive unable to authenticate
@@ -729,6 +751,12 @@ laser_status_t laser_scsi_cdb(int token,
     int attempts_made = 0;
     int reason_logged = 0;
 
+    /* How many attempts in a row failed before the CBW could be handed over.
+     * See the verdict at the end of the loop: a device that cannot accept 31
+     * bytes on its bulk endpoint, every time, for the whole budget, is not a
+     * device that is busy. */
+    int cbw_never_sent = 0;
+
     for (int attempt = 1; attempt <= LASER_MAX_RETRIES; attempt++) {
         attempts_made = attempt;
 
@@ -753,17 +781,31 @@ laser_status_t laser_scsi_cdb(int token,
             break;
         }
 
+        /* Counted, not acted on here: one failure to hand the CBW over says
+         * nothing - a bridge under load, a transient on the bus. The verdict
+         * needs the whole budget, so it is drawn after the loop. */
+        if (rc == BOT_FAIL_NOT_SENT) {
+            cbw_never_sent++;
+        }
+
         if (rc == BOT_FAIL_NO_DEVICE) {
-            /* The drive has left the bus. Retrying cannot bring it back,
-             * and each further attempt costs a full set of USB timeouts
-             * to establish the same thing - on an unplug mid-playback,
-             * that is the difference between failing at once and failing
-             * a minute later, per read, with libVLC's input thread
-             * stalled throughout. Reported as ERR_IO, the documented
-             * "drive misbehaving/gone" outcome; ERR_MEDIA_GONE is
-             * reserved for a disc that went away while the drive stayed. */
+            /* The drive has left the bus. Retrying cannot bring it back, and
+             * each further attempt costs a full set of USB timeouts to
+             * establish the same thing - on an unplug mid-playback, that is
+             * the difference between failing at once and failing a minute
+             * later, per read, with libVLC's input thread stalled
+             * throughout.
+             *
+             * REPORTED AS ITS OWN STATUS, because this is the strongest
+             * statement this layer can make and flattening it into ERR_IO
+             * loses the only thing a caller can act on. An I/O error invites
+             * a retry; a caller that retries here walks a whole UDF tree one
+             * dead command at a time. ERR_MEDIA_GONE would be latched
+             * correctly by every consumer, but it says the drive answered,
+             * which it did not. */
             LOGW("token=%d: device no longer present, not retrying", token);
-            result = LASER_ERR_IO;
+            entry->device_gone = 1;
+            result = LASER_ERR_NO_DEVICE;
             break;
         }
 
@@ -919,8 +961,44 @@ laser_status_t laser_scsi_cdb(int token,
      * logged, and then turned back into an ordinary I/O error, leaving
      * the stream layer unable to tell a permanently refused sector from a
      * scratched one and looping on it forever. */
+    /* EVERY ATTEMPT FAILED BEFORE THE CBW LEFT: the device is gone, whatever
+     * libusb called it.
+     *
+     * LIBUSB_ERROR_NO_DEVICE is the answer the kernel gives for a device that
+     * has left the bus while its descriptor is still open. It is not the only
+     * answer available: a descriptor closed underneath the handle, or a
+     * controller that tears the URB down before it marks the device absent,
+     * both produce LIBUSB_ERROR_IO instead - and that is indistinguishable,
+     * one attempt at a time, from a bridge having a bad moment.
+     *
+     * The whole budget makes it distinguishable. A CBW is 31 bytes on a bulk
+     * endpoint; a device that will not take them once may be busy, but one
+     * that will not take them on any of LASER_MAX_RETRIES attempts spread
+     * over several seconds is not there. Concluding so costs nothing when the
+     * conclusion is wrong: the command has failed either way, and the only
+     * difference is whether the caller is told to stop or invited to try
+     * again on a drive that will not answer.
+     *
+     * Only when EVERY attempt failed that way. A single successful CBW
+     * anywhere in the budget proves the endpoint was alive, and the failure
+     * that followed belongs to the medium or the command.
+     *
+     * Never over a cancellation, which the loop above can break out on: the
+     * caller asked for this to stop, and telling it the hardware disappeared
+     * would answer a question it did not ask. */
+    if (result != LASER_OK && result != LASER_ERR_CANCELLED &&
+        attempts_made > 0 && cbw_never_sent == attempts_made) {
+        LOGW("token=%d: cdb 0x%02x - the CBW could not be sent on any of "
+             "%d attempt(s); treating the device as gone",
+             token, cdb[0], attempts_made);
+        entry->device_gone = 1;
+        result = LASER_ERR_NO_DEVICE;
+        reason_logged = 1;
+    }
+
     if (result != LASER_OK &&
         result != LASER_ERR_MEDIA_GONE &&
+        result != LASER_ERR_NO_DEVICE &&
         result != LASER_ERR_REFUSED &&
         result != LASER_ERR_SCRAMBLED &&
         result != LASER_ERR_NO_KEY &&
@@ -946,12 +1024,12 @@ laser_status_t laser_scsi_cdb(int token,
  * Public: LBA-aware chunked block reads
  * ============================================================================ */
 
-/** Build the CDB for one chunk. The only thing the two public helpers below do
+/* Build the CDB for one chunk. The only thing the two public helpers below do
  * not have in common, which is why it is the only thing they pass in. */
 typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
                                   const void *ctx);
 
-/** The chunked read both helpers are. Everything here was written twice, once
+/* The chunked read both helpers are. Everything here was written twice, once
  * per sector size: the same loop, the same buffer stride, the same MEDIA_GONE
  * rule, the same "zero blocks is a failure, not a short read" reasoning, and
  * the same two paragraphs explaining them. Two copies of a rule is two places
@@ -963,6 +1041,172 @@ typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
  * @param cdb_len    10 for READ(10), 12 for READ CD
  * @param what       what to call these in a log line ("blocks", "sectors")
  */
+/* Halve this device's transfer cap, if there is room left to halve.
+ *
+ * @return 1 if the cap actually shrank, 0 if it was already at the floor.
+ */
+/* ============================================================================
+ * DVD region (laser_region_mismatch)
+ * ========================================================================= */
+
+/* Region masks, in both structures, are "one bit per region, SET means
+ * PROHIBITED": a region-1 disc reads 0xFE, a drive set to region 2 reads
+ * 0xFD. So the regions something permits are the complement, and disc and
+ * drive agree exactly when their permitted sets intersect. */
+#define LASER_REGION_ALL        0xFF
+
+/* Byte 4 >> 6 of the RPC state. 0 means no region has been set yet, which is
+ * not a mismatch: the drive will adopt the first disc's region by itself, and
+ * that is the drive's decision to make, not ours to pre-empt with a warning. */
+#define LASER_RPC_TYPE_NONE     0x00
+
+/* Byte 6 of the RPC state. 0 is RPC-1: the drive enforces nothing and any
+ * disc plays regardless of what its copyright structure says. */
+#define LASER_RPC_SCHEME_NONE   0x00
+
+/* REPORT KEY, key format 08h: the drive's RPC state.
+ *
+ * @return 1 and the three fields set, 0 if the drive would not answer -
+ *         which includes every non-DVD drive and is not an error here. */
+static int report_rpc_state(int token, uint8_t *type, uint8_t *mask,
+                            uint8_t *scheme)
+{
+    uint8_t cdb[12] = { 0 };
+    uint8_t data[8] = { 0 };
+    int actual = 0;
+
+    cdb[0]  = 0xA4;                  /* REPORT KEY */
+    cdb[8]  = sizeof(data) >> 8;     /* allocation length, big-endian */
+    cdb[9]  = sizeof(data) & 0xFF;
+    cdb[10] = 0x08;                  /* key format: RPC state. The AGID bits
+                                      * of this byte are reserved for this
+                                      * format - the drive allocates nothing
+                                      * here - so it carries the format
+                                      * alone. */
+
+    if (laser_scsi_cdb(token, cdb, sizeof(cdb), data, sizeof(data), 1,
+                       &actual) != LASER_OK
+     || actual < (int)sizeof(data)) {
+        return 0;
+    }
+
+    *type   = data[4] >> 6;
+    *mask   = data[5];
+    *scheme = data[6];
+    return 1;
+}
+
+/* READ DVD STRUCTURE, format 01h: the disc's copyright information, whose
+ * second byte is the Region Management Information.
+ *
+ * @return 1 and the mask set, 0 if the medium is not a DVD or carries no
+ *         copyright structure. */
+static int read_disc_region_mask(int token, uint8_t *rmi)
+{
+    uint8_t cdb[12] = { 0 };
+    uint8_t data[8] = { 0 };
+    int actual = 0;
+
+    cdb[0] = 0xAD;                   /* READ DVD STRUCTURE */
+    cdb[6] = 0x00;                   /* layer 0 */
+    cdb[7] = 0x01;                   /* format: copyright information */
+    cdb[8] = sizeof(data) >> 8;
+    cdb[9] = sizeof(data) & 0xFF;
+
+    if (laser_scsi_cdb(token, cdb, sizeof(cdb), data, sizeof(data), 1,
+                       &actual) != LASER_OK
+     || actual < (int)sizeof(data)) {
+        return 0;
+    }
+
+    *rmi = data[5];
+    return 1;
+}
+
+int laser_region_mismatch(int token, uint8_t *drive_mask, uint8_t *disc_mask)
+{
+    uint8_t type, dr_mask, scheme, di_mask;
+
+    if (!report_rpc_state(token, &type, &dr_mask, &scheme)) {
+        return 0;                    /* not a DVD drive, or would not say */
+    }
+
+    if (scheme == LASER_RPC_SCHEME_NONE || type == LASER_RPC_TYPE_NONE) {
+        return 0;                    /* enforces nothing, or nothing set yet */
+    }
+
+    if (!read_disc_region_mask(token, &di_mask)) {
+        return 0;                    /* not a DVD, or no copyright structure */
+    }
+
+    if (di_mask == 0x00) {
+        return 0;                    /* region-free disc: plays anywhere */
+    }
+
+    /* Permitted sets are the complements; they agree if they intersect. */
+    if ((uint8_t)(~dr_mask & ~di_mask & LASER_REGION_ALL) != 0) {
+        return 0;
+    }
+
+    /* Written only on the answer that makes them meaningful - see the
+     * contract in laser.h. A caller that ignores the return value and reads
+     * them anyway is asking about a comparison that did not happen. */
+    if (drive_mask != NULL) {
+        *drive_mask = dr_mask;
+    }
+    if (disc_mask != NULL) {
+        *disc_mask = di_mask;
+    }
+
+    LOGI("token=%d: region mismatch, drive mask 0x%02x, disc mask 0x%02x",
+         token, dr_mask, di_mask);
+    return 1;
+}
+
+int laser_status_is_positional(int status)
+{
+    /* Deliberately next to laser_scsi_cdb(), which is the only place any of
+     * these values is produced: whoever adds a status there has this list in
+     * the same file, and the contract explaining the split is on the
+     * declaration in laser.h. Splitting the two - the rule in one file, the
+     * classification in another - is what made a consumer's private copy
+     * drift in the first place. */
+    switch (status) {
+    case LASER_ERR_SCRAMBLED:
+    case LASER_ERR_REGION:
+    case LASER_ERR_REFUSED:
+        return 1;
+    default:
+        /* Includes every non-negative value: a block count is not a status,
+         * and answering "not positional" for it is the correct reading of a
+         * successful read. */
+        return 0;
+    }
+}
+
+static int narrow_transfer_cap(laser_entry_t *entry)
+{
+    pthread_mutex_lock(&entry->io_lock);
+
+    int cap = entry->max_transfer_bytes;
+    if (cap <= LASER_MIN_BYTES_PER_TRANSFER) {
+        pthread_mutex_unlock(&entry->io_lock);
+        return 0;
+    }
+
+    cap /= 2;
+    if (cap < LASER_MIN_BYTES_PER_TRANSFER) {
+        cap = LASER_MIN_BYTES_PER_TRANSFER;
+    }
+    entry->max_transfer_bytes = cap;
+
+    pthread_mutex_unlock(&entry->io_lock);
+
+    LOG_QUIRK(entry, "transfer failed, limiting this device to %d bytes "
+                     "per command from now on", cap);
+    return 1;
+}
+
 static int read_chunked(int token, uint32_t lba, int num_blocks,
                         int block_size, int cdb_len,
                         build_read_cdb_fn build_cdb, const void *ctx,
@@ -975,10 +1219,26 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
         return 0;
     }
 
-    const int max_blocks_per_chunk = LASER_MAX_BYTES_PER_TRANSFER / block_size;
+    /* Needed for the per-device transfer cap below. A miss is not fatal here:
+     * laser_scsi_cdb() looks the token up again and reports NO_SUCH_TOKEN
+     * properly, so this only costs the negotiation. */
+    laser_entry_t *entry = laser_lookup(token);
     int blocks_done = 0;
 
     while (blocks_done < num_blocks) {
+        /* Re-read the cap every time round: another thread reading from the
+         * same drive may have narrowed it since the last chunk, and this is
+         * the only place it is consulted. */
+        int cap = entry != NULL ? entry->max_transfer_bytes
+                                : LASER_MAX_BYTES_PER_TRANSFER;
+        int max_blocks_per_chunk = cap / block_size;
+        if (max_blocks_per_chunk < 1) {
+            /* A cap below one block would compute a chunk of zero and stall
+             * the loop. One block is the smallest thing that makes progress,
+             * so it is the floor whatever the cap says. */
+            max_blocks_per_chunk = 1;
+        }
+
         int chunk = num_blocks - blocks_done;
         if (chunk > max_blocks_per_chunk) {
             chunk = max_blocks_per_chunk;
@@ -1010,6 +1270,11 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
              * after an eject they would keep hammering a drive that can no
              * longer answer.
              *
+             * NO_DEVICE propagates for a stronger version of the same
+             * reason: there is no drive to read around, and a caller that
+             * treats it as a short read spends a dead command per block for
+             * as long as it cares to walk.
+             *
              * CANCELLED propagates for the same reason and one more: the
              * caller asked for it, so reporting progress instead would have
              * it carry on around an interruption it requested itself.
@@ -1017,9 +1282,33 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
              * Partial data already written into `buffer` is left as-is and
              * must be ignored by the caller on a negative return - same rule
              * as every other error path here. */
-            if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_CANCELLED) {
+            if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
+                st == LASER_ERR_CANCELLED) {
                 return (int)st;
             }
+
+            /* A plain I/O failure may be the BRIDGE rather than the disc.
+             * Some USB-ATAPI bridges cannot carry a full 64 KiB data phase
+             * and fail the whole command rather than returning a short one;
+             * the same request split smaller goes through. So before giving
+             * up, halve this device's cap and retry the SAME blocks - once
+             * per halving, three times at most between the ceiling and the
+             * floor, after which the failure is reported.
+             *
+             * THIS LOOP TERMINATES ON A LOCAL VARIANT: narrow_transfer_cap()
+             * returns 0 once the floor is reached, and every retry strictly
+             * decreases a value bounded below, so the number of retries per
+             * chunk is bounded by log2(MAX/MIN) whatever any other thread is
+             * doing.
+             *
+             * Retried only when the chunk is larger than one block: at one
+             * block there is nothing left to split and the failure is about
+             * the medium. */
+            if (st == LASER_ERR_IO && chunk > 1 && entry != NULL &&
+                narrow_transfer_cap(entry)) {
+                continue;
+            }
+
             return blocks_done > 0 ? blocks_done : (int)st;
         }
 

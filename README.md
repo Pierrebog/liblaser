@@ -1,4 +1,4 @@
-# LASER — Library for Android-accessed SCSI External Readers
+# LASER — Library for Accessing SCSI External Readers
 
 ## 1. Goal
 

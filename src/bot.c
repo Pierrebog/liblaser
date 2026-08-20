@@ -48,7 +48,7 @@
 
 /* USB_BOT_STATUS_PASS/FAIL/PHASE_ERROR are in laser_internal.h: they are the
  * value space of laser_bot_send_locked()'s csw_status out-parameter, which
- * scsi.c reads, so they belong with that declaration rather than here. */
+ * scsi.c reads. */
 
 /* The Bulk-Only Mass Storage Reset class request is issued by
  * laser_mass_storage_reset() in usb.c, and its two constants live there with
@@ -158,10 +158,6 @@ static void bot_clear_stall(laser_entry_t *entry, unsigned char endpoint)
  * about it - lives with the declaration in laser_internal.h, because that
  * is what scsi.c reads. What follows is why each wire condition maps to the
  * code it does, which is only useful next to the code that decides it.
- *
- * Unlike the classification probe's version of this function, this one
- * supports DATA-OUT (needed for SEND KEY) via the data_in parameter -
- * everything else about the framing is unchanged.
  * ============================================================================ */
 
 int laser_bot_send_locked(laser_entry_t *entry,
@@ -266,7 +262,9 @@ int laser_bot_send_locked(laser_entry_t *entry,
              *
              * Everything arrived: the device finished its data phase and
              * the clock simply ran out on the way. Its CSW is waiting on
-             * the Bulk-In pipe, so carrying on to read it is correct. */
+             * the Bulk-In pipe, so carrying on to read it is correct -
+             * this is the case the previous blanket tolerance was aimed
+             * at, and it stays tolerated. */
             if (transferred == data_len) {
                 LOGW("token=%d: data phase timed out but completed (%d bytes), "
                      "continuing to CSW", entry->token, transferred);

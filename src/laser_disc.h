@@ -102,6 +102,9 @@ typedef struct {
  * every other entry point of this library now requires - see laser.h. A
  * token with no claim yields LASER_DISC_UNKNOWN without contacting the drive.
  *
+ * Without that claim, a release by another consumer could tear the device
+ * down mid-walk, between two of the reads below.
+ *
  * A token whose last claim is being dropped concurrently yields
  * LASER_DISC_UNKNOWN - the same answer as an unreadable disc, for the same
  * reason the enum gives one value to three situations.
@@ -124,8 +127,8 @@ typedef struct {
  *   3. a minimal ISO9660 walk, which answers for both Video CD kinds: VCD
  *      by /VCD/INFO.VCD and its "VIDEO_CD" magic, SVCD by /SVCD/INFO.SVD
  *      and "SUPERVCD". Run only on a medium step 1 established IS a CD,
- *      since nothing else can carry the filesystem it looks for - which is
- *      why a plain data DVD no longer pays for it.
+ *      since nothing else can carry the filesystem it looks for - so a plain
+ *      data DVD does not pay for it.
  *
  * THE RULE IS THE FILESYSTEM THE READER WILL USE, and applying it is what
  * makes steps 2 and 3 use different ones rather than one being a fallback
@@ -146,9 +149,9 @@ typedef struct {
  * Descriptor at sector 16 of the track carrying the filesystem, and the walk
  * addresses it relative to the first data track's start LBA - taken from the
  * table of contents step 1 has already read, so it costs no extra command.
- * It used to read sector 16 of the MEDIUM, which is the same sector only on
- * a disc whose first data track starts at LBA 0: true of every pressed VCD
- * and SVCD, and silently wrong for anything else.
+ * Sector 16 of the MEDIUM would be the same sector only on a disc whose
+ * first data track starts at LBA 0: true of every pressed VCD and SVCD, and
+ * silently wrong for anything else.
  *
  * What remains outside its reach is a filesystem in a LATER SESSION of a
  * multi-session disc. Format 0 of READ TOC reports tracks, not sessions, so

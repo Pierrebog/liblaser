@@ -28,20 +28,19 @@
 
 #include <stdint.h>
 #include <pthread.h>
-#include <sys/types.h>
 #include <libusb.h>
 
 /* For laser_status_t and laser_log_level_t, both of which appear below. */
 #include "laser.h"
 
-/** ---------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------
  * Logging, defined once here rather than twice in the .c files.
  *
  * registry.c and the transport files each carried their own copy of these three
  * macros, identical apart from a comment, which is how the two drifted into
- * disagreeing about what LOGE meant. They also went straight to
- * __android_log_print(), which is what laser_set_log_cb() exists to make
- * optional - so the destination has to be resolved in one place anyway.
+ * disagreeing about what LOGE meant. They also went straight to the
+ * platform's log, which is what laser_set_log_cb() exists to make optional -
+ * so the destination has to be resolved in one place anyway.
  *
  * LOGE is for programming errors on this library's own API - a caller
  * violating the contract in laser.h - and for conditions that indicate a bug
@@ -83,44 +82,39 @@ void laser_log(laser_log_level_t level, const char *fmt, ...)
  * and trivially safe to reason about, at the cost of this arbitrary cap. */
 #define LASER_MAX_DEVICES 8
 
-/** Identity of the open file description a token refers to.
+/* Safe upper bound on the data phase of a single BOT transaction, and the
+ * starting value of laser_entry_t::max_transfer_bytes. Well under the SCSI
+ * READ(10) 16-bit block-count field's own limit (65535 blocks) - this cap
+ * exists to stay comfortably inside USB bulk transfer sizes that are reliable
+ * in practice across Android USB host controller implementations, not because
+ * of a SCSI-level limit. */
+#define LASER_MAX_BYTES_PER_TRANSFER  (64 * 1024)
+
+/* Floor for the per-device negotiation. Below this the per-command overhead
+ * dominates so heavily that there is nothing left to save, and a bridge that
+ * cannot manage 8 KiB in one command has a problem no tuning will fix.
  *
- * A token IS a file descriptor number, and the operating system reuses those
- * numbers. Once the Kotlin side closes a connection, the same number can come
- * back for a completely different drive - or for something that is not a drive
- * at all - while a registration made under the old one is still in the table.
- * Serving that registration means addressing the wrong device through a libusb
- * handle wrapping a descriptor that no longer exists.
- *
- * fstat() answers the question at the only place it can be asked cheaply: on
- * the descriptor itself. It needs no libusb handle - re-reading the USB
- * descriptor would mean a second context and a second wrap, i.e. the whole
- * expensive setup this check exists to avoid repeating - and it works under
- * LIBUSB_OPTION_NO_DEVICE_DISCOVERY, where libusb has no bus topology and
- * therefore no port path to compare either.
- *
- * A STRONG HEURISTIC, NOT A PROOF. A usbfs node destroyed and recreated
- * normally gets a fresh inode, but inode numbers are themselves reusable, so
- * two successive devices could in principle present the same triple. The check
- * turns "always wrong" into "almost never wrong", which is worth having; it is
- * not a guarantee and must not be relied on as one. */
-typedef struct {
-    /** Zero when the fstat() failed, in which case nothing is compared: an
-     * unreadable descriptor is not evidence of a recycled one, and refusing
-     * to register on it would break a device over a diagnostic. */
-    int   valid;
-    dev_t dev;
-    ino_t ino;
-    /** Device node the descriptor refers to. Also catches a number that has
-     * come back as something other than a character device at all. */
-    dev_t rdev;
-} laser_fd_id_t;
+ * Chunk sizing floors at ONE BLOCK independently of this, which matters for
+ * READ CD: 8192 / 2352 is three sectors, and a cap set below one block would
+ * otherwise compute a chunk of zero and make the read loop stand still. */
+#define LASER_MIN_BYTES_PER_TRANSFER  (8 * 1024)
 
 /** USB Mass Storage Bulk-Only Transport (BOT) - see bot.c for the
  * protocol implementation itself; this header only needs the shape of
  * the per-device state bot.c and scsi.c operate on. */
 typedef struct {
     /* Is this slot a live, fully set-up registration?
+     *
+     * ONE FLAG IS ENOUGH because of WHEN it is written. Registration happens
+     * only inside laser_acquire(), under g_registry_lock, and this field is
+     * written LAST - so a slot under construction is not in the table at all.
+     * Publishing it earlier would need a second flag beside it: the USB setup
+     * is slow (control transfers, a Mass Storage Reset with its settle sleep,
+     * a spin-up wait that can legally take ten seconds), and throughout that
+     * window the entry would match on token with a NULL handle.
+     *
+     * Only a lock holder ever writes a free slot, and there is only ever one
+     * at a time, so two threads cannot reserve the same fd either.
      *
      * Written under g_registry_lock, read under g_table_lock. */
     int in_use;
@@ -130,9 +124,37 @@ typedef struct {
      * Teardown happens when this reaches zero and not before - see
      * laser_release()'s contract in laser.h.
      *
+     * EVERY REGISTRATION HAS A CLAIM BEHIND IT. A device is registered by
+     * laser_acquire() and by nothing else, so refs is 1 the moment the entry
+     * becomes visible, and an entry with refs == 0 does not exist. One that
+     * did would be indestructible, since teardown only ever happens on the
+     * 1 -> 0 transition.
+     *
      * Written and read under g_registry_lock, which is also what makes
      * "register, then count" a single atomic step. */
     int refs;
+
+    /* Largest transfer, in BYTES, this device has been shown to tolerate.
+     *
+     * Starts at LASER_MAX_BYTES_PER_TRANSFER and only ever shrinks, halving
+     * each time a chunked read comes back LASER_ERR_IO, with a floor at
+     * LASER_MIN_BYTES_PER_TRANSFER. A bridge that cannot manage the full 64
+     * KiB in one command is a property OF THE BRIDGE, so it belongs here
+     * rather than in a consumer: negotiated in one module it would leave the
+     * others - CD-DA and VCD reach the drive through cdrom.c and
+     * laser_read_cd_blocks() - failing on hardware the first had tamed.
+     *
+     * IN BYTES, NOT BLOCKS, because that is the quantity the bridge reacts
+     * to and because it has to serve both block sizes: 2048 for READ(10),
+     * 2352 for READ CD. Expressed in blocks it would mean different things
+     * to the two callers.
+     *
+     * Written under io_lock (see narrow_transfer_cap in scsi.c), read
+     * without it when sizing a chunk. That read is a benign race by
+     * construction: the value only ever decreases, so a stale read asks for
+     * slightly too much and is corrected on the spot by the same mechanism
+     * that shrank it. */
+    int max_transfer_bytes;
 
     /* Set by the laser_release() that takes refs to zero, immediately before
      * teardown, and never cleared - the slot is memset moments later, so a
@@ -153,6 +175,28 @@ typedef struct {
      * lock on the transaction path, which is the one thing those locks are
      * designed never to be on. */
     int cancelled;
+
+    /* Latched once this device has been shown to have left the bus, so that
+     * every later command on the token fails without touching libusb.
+     *
+     * WHAT IT SAVES. Establishing that a device is gone is expensive: on a
+     * bridge whose descriptor no longer answers, it takes the whole retry
+     * budget - six attempts and the delays between them, around two and a
+     * half seconds - to conclude what the previous command concluded already.
+     * A caller that reads sector by sector pays that per sector: an audio CD
+     * demuxer willing to skip sixteen bad reads before giving up spends forty
+     * seconds doing so, and none of it tells anyone anything new.
+     *
+     * TERMINAL FOR THIS REGISTRATION, which is what makes latching it sound.
+     * Unlike a missing medium, which comes back when a disc is inserted, a
+     * device that has left the bus does not come back on this token at all -
+     * it returns as a new descriptor, hence a new registration, hence a fresh
+     * entry with this flag clear.
+     *
+     * Read WITHOUT any lock, on the same terms as `cancelled` above: the only
+     * transition is 0 -> 1, so a reader that misses it pays one more command
+     * and sees it on the next. */
+    int device_gone;
 
     /* Dedicated libusb context for this device - deliberately NOT the
      * shared default (NULL) context. A playback session can be open for
@@ -189,12 +233,6 @@ typedef struct {
     uint16_t pid;
     uint16_t bcd_device;
 
-    /* What `token` pointed at when this entry was registered. Compared by
-     * laser_acquire() against the descriptor it is handed, so that a recycled
-     * number is registered afresh instead of being served from here. See
-     * laser_fd_id_t above. */
-    laser_fd_id_t fd_id;
-
     /* Set once the residue-versus-wire-count contradiction has been
      * reported for this device, so it is logged once per session
      * instead of once per transfer. On a bridge that always gets the
@@ -205,7 +243,7 @@ typedef struct {
      * report. */
     int residue_quirk_logged;
 
-    /* Nonzero while a probe is in flight: shortens the BOT phase timeouts.
+    /** Nonzero while a probe is in flight: shortens the BOT phase timeouts.
      *
      * Set and cleared around the command, under io_lock, by whoever issues
      * it. A probe is a command that needs no medium and that a working device
@@ -278,8 +316,8 @@ typedef struct {
  * Look up the entry for a token. Returns NULL if the token is not
  * registered - which now means exactly one thing, since a device is
  * registered by laser_acquire() and by nothing else, and a slot under
- * construction is not in the table at all. There is no longer a
- * "registered but not usable yet" state for this to hide.
+ * construction is not in the table at all: there is no "registered but not
+ * usable yet" state for this to hide.
  *
  * The returned pointer is stable for the lifetime of the registration
  * (entries live in a fixed table, never moved or reallocated) - callers in
@@ -394,18 +432,24 @@ enum {
     LASER_OPTICAL_YES = 1,
     /** INQUIRY went unanswered. Neither a yes nor a no - see below. */
     LASER_OPTICAL_NO_ANSWER = -1,
+    /** The device left the bus during the probe. Not "would not answer" but
+     * "is not there": kept apart from LASER_OPTICAL_NO_ANSWER because the
+     * caller's response differs. Silence is a reason to register the device
+     * anyway and let a read fail quickly; absence is a reason not to register
+     * it at all, since every field the entry would carry describes a device
+     * that has gone. */
+    LASER_OPTICAL_GONE = -2,
 };
 
 /**
  * Work out which Logical Unit on this device is the optical drive, store it
  * in entry->lun, and say whether it is one.
  *
- * ONE FUNCTION, WHERE THERE USED TO BE TWO. laser_discover_lun() chose the
- * unit and laser_is_optical() then asked what that unit was - by re-issuing
- * the very INQUIRY the choice had just been made on. Beyond the wasted
- * command, the two could disagree about what "optical" means, since each
- * classified the peripheral device type itself. Selecting a unit and
- * classifying it are one question asked once.
+ * ONE FUNCTION, because selecting a unit and classifying it are one question
+ * asked once. Split in two, the second half would re-issue the very INQUIRY
+ * the choice had just been made on, and the two halves could disagree about
+ * what "optical" means since each would classify the peripheral device type
+ * itself.
  *
  * Issues GET MAX LUN (the Bulk-Only class request) and an INQUIRY per unit,
  * keeping the first whose peripheral device type says CD/DVD. Falls back to
@@ -423,6 +467,11 @@ enum {
  * enclosures pair the two, so this is not a corner case. Silence is not a
  * no, so it gets its own answer rather than being folded into either.
  *
+ * LASER_OPTICAL_GONE IS NOT LASER_OPTICAL_NO_ANSWER. A device that has left
+ * the bus fails every command instantly rather than timing out, and nothing
+ * about it will change: the same drive plugged back in arrives as a new
+ * descriptor and a new token.
+ *
  * LASER_OPTICAL_NO_ANSWER MATTERS BEYOND "we could not tell". INQUIRY is
  * mandatory and needs no medium, so a device that will not serve it is not a
  * device that is still warming up: it is one that is not answering at all.
@@ -439,7 +488,8 @@ enum {
  * caller's memset) until this runs, so a failure to call it at all degrades
  * to the previous behaviour rather than to something undefined.
  *
- * @return one of LASER_OPTICAL_YES, LASER_OPTICAL_NO, LASER_OPTICAL_NO_ANSWER.
+ * @return one of LASER_OPTICAL_YES, LASER_OPTICAL_NO, LASER_OPTICAL_NO_ANSWER
+ *         or LASER_OPTICAL_GONE.
  */
 int laser_probe_lun(laser_entry_t *entry);
 
@@ -452,7 +502,7 @@ int laser_probe_lun(laser_entry_t *entry);
  * parameter's value space, and scsi.c is what reads it. */
 #define USB_BOT_STATUS_PASS        0x00
 #define USB_BOT_STATUS_FAIL        0x01
-/** Phase Error: the device and host disagree about the transfer that just
+/* Phase Error: the device and host disagree about the transfer that just
  * happened badly enough that the device's state machine is out of sync.
  * BBB 6.6.3 is explicit that this is the status a device returns when it
  * "may require a reset to recover", and 6.7 requires the host to perform a

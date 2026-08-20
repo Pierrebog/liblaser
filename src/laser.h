@@ -1,5 +1,6 @@
 /*****************************************************************************
- * laser.h: public API of the shared Android/USB SCSI-MMC transport
+ * laser.h: public API of liblaser - Library for Accessing SCSI External
+ *          Readers
  *****************************************************************************
  * Copyright (C) 2026 Authors
  *
@@ -21,12 +22,11 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************
  * This is the single source of truth for "how do we talk SCSI-MMC to an
- * optical drive over USB Bulk-Only Transport, from userspace, on Android"
- * - used by:
+ * optical drive over USB Bulk-Only Transport, from userspace" - used by:
  *
  *   - the "laser" VLC access module (disc classification: is this a
- *     CD audio / DVD-Video / BD-Video disc, and what's its name; and the
- *     sector reads that feed everything layered on top of it)
+ *     CD audio / Video-CD / DVD-Video / BD-Video disc, and what's its name;
+ *     and the sector reads that feed everything layered on top of it)
  *   - libdvdcss (ioctl.c, HAVE_LASER branches: CSS authentication,
  *     REPORT KEY / SEND KEY / READ DVD STRUCTURE)
  *   - VLC's cdda module (cdrom.c, HAVE_LASER branches: READ TOC,
@@ -57,12 +57,13 @@ extern "C" {
 /* ============================================================================
  * Logging
  *
- * By default this library writes to Android's log under the "Laser" tag,
- * which is the right thing inside an Android app and useless anywhere else -
- * and impossible to silence. So the destination is a callback, exactly as
- * libbluray's bd_set_debug_handler() and libdvdnav's logger do it, and for
- * the same reason: a library that has decided where its diagnostics go has
- * decided it for every application that embeds it.
+ * By default this library writes to whatever its platform offers - the
+ * system log under the "Laser" tag on Android, stderr elsewhere - which is
+ * a guess, and one no application should be stuck with. So the destination
+ * is a callback, exactly as libbluray's bd_set_debug_handler() and
+ * libdvdnav's logger do it, and for the same reason: a library that has
+ * decided where its diagnostics go has decided it for every application
+ * that embeds it.
  * ============================================================================ */
 
 typedef enum {
@@ -82,7 +83,7 @@ typedef void (*laser_log_cb_t)(void *opaque, laser_log_level_t level,
 
 /**
  * Route this library's diagnostics to @p cb. Passing NULL restores the
- * default Android logger.
+ * platform default described above.
  *
  * PROCESS-WIDE AND NOT PER-TOKEN, because the messages this library most
  * needs to deliver are the ones about a token that does not exist yet or no
@@ -97,7 +98,12 @@ typedef void (*laser_log_cb_t)(void *opaque, laser_log_level_t level,
  */
 void laser_set_log_cb(laser_log_cb_t cb, void *opaque);
 
-/** Outcome of any call in this header that reports one. */
+/** Outcome of any call in this header that reports one.
+ *
+ * Declared up here, before the first function that returns it, rather than
+ * next to laser_scsi_cdb() where it started life: it was that function's
+ * return type alone until acquiring a device and opening a CSS session
+ * started reporting through it too. */
 typedef enum {
     /** Command completed, data (if any) is valid. */
     LASER_OK = 0,
@@ -192,14 +198,44 @@ typedef enum {
      * from a drive that failed, and log accordingly - a teardown that prints
      * I/O errors trains people to ignore I/O errors. */
     LASER_ERR_CANCELLED = -9,
+
+    /**
+     * The device has left the USB bus - unplugged, or its connection torn
+     * down underneath us. Not a statement about the medium, about a sector
+     * or about the command: there is nothing on the other end.
+     *
+     * TERMINAL FOR THIS TOKEN, and more strongly so than any other value
+     * here. A disc can be swapped back in, a scrambled sector can become
+     * readable once a handshake succeeds, a drive that refused a large
+     * transfer will take a smaller one - but a device that has left the bus
+     * comes back, if it comes back at all, with a new descriptor and a new
+     * token. Nothing a caller does with THIS one can succeed, so a caller
+     * that keeps asking is buying a full set of USB timeouts per attempt to
+     * be told the same thing.
+     *
+     * Kept apart from LASER_ERR_MEDIA_GONE, which it superficially
+     * resembles. That one means the drive answered and said the medium is
+     * gone or changed - the drive is still there, and on a swap it will
+     * answer again. This one means the drive did not answer because it is
+     * not there. Consumers that latch either one and stop will behave
+     * correctly with both; consumers that distinguish them can offer "insert
+     * a disc" for the first and "reconnect the drive" for the second.
+     *
+     * Kept apart from LASER_ERR_IO for the reason that matters most in
+     * practice: an I/O error invites a retry and this must not get one.
+     */
+    LASER_ERR_NO_DEVICE = -10,
 } laser_status_t;
 
 /** ============================================================================
  * Registry: token (== fd) <-> USB device handle
  *
- * The token is simply the fd itself - an already permission-granted
- * file descriptor from android.hardware.usb.UsbDeviceConnection.
- * getFileDescriptor().
+ * The token is simply the fd itself - an already-open file descriptor for
+ * the USB device, on which the caller already holds whatever permission the
+ * platform requires. On Android that is the one returned by
+ * android.hardware.usb.UsbDeviceConnection.getFileDescriptor(); elsewhere it
+ * is an open descriptor on the device node. This library neither obtains it
+ * nor checks how it was obtained.
  *
  * REGISTRATION IS laser_acquire(), and nothing else. The first claim on an
  * fd performs the one-time device setup - wraps the fd with a DEDICATED
@@ -214,7 +250,8 @@ typedef enum {
  * Every other function here (laser_scsi_cdb(), laser_read_blocks(),
  * laser_read_cd_blocks(), the CSS session calls, laser_disc_identify())
  * requires that a claim already be held, and answers
- * LASER_ERR_NO_SUCH_TOKEN if one is not.
+ * LASER_ERR_NO_SUCH_TOKEN if one is not - see laser_acquire() for why
+ * registration hangs off the claim and off nothing else.
  *
  * COST, because it is not negligible and it is paid inside laser_acquire():
  * on a working drive this is well under a second, but a cold mechanism
@@ -223,10 +260,9 @@ typedef enum {
  * also globally serialized, so a second device's first claim queues behind
  * it. Do not call laser_acquire() from a thread that must stay responsive.
  *
- * Ownership of the fd itself is NOT taken by any of this - the Kotlin
- * side remains responsible for eventually closing it, after the last
- * consumer has called laser_release() below (see that function's doc
- * comment for when).
+ * Ownership of the fd itself is NOT taken by any of this - whoever opened it
+ * remains responsible for eventually closing it, after the last consumer has
+ * called laser_release() below (see that function's doc comment for when).
  *
  * This is also what gets threaded, cast to/from a pointer, through the
  * dvdcss_stream_cb / dvd_reader_stream_cb / dvdcss->i_fd / vcddev_t
@@ -244,7 +280,14 @@ typedef enum {
  * is no entry - so a claim is not merely good manners, it is what makes the
  * device usable at all.
  *
- * WHAT THE COUNT IS FOR. A token routinely has several consumers
+ * A registration without a claim would be a state nothing could get out of:
+ * teardown only ever happens when a claim count falls to zero, and a count
+ * never incremented never falls. The entry would hold a libusb handle and one
+ * of a small number of table slots for the life of the process - and once its
+ * owner closed the descriptor underneath it and the OS recycled that number,
+ * the stale entry would answer for whatever device came next.
+ *
+ * WHAT THE COUNT IS FOR, beyond that. A token routinely has several consumers
  * at once: playing a DVD means the access module and libdvdcss both hold the
  * same fd. Without a count, the first of them to finish tore the registration
  * down for all of them. That this was harmless rested on an ordering libVLC
@@ -259,16 +302,6 @@ typedef enum {
  * consumer that cannot get the drive learns it while it can still fail
  * cleanly.
  *
- * A RECYCLED DESCRIPTOR IS NOT SERVED FROM THE OLD REGISTRATION. Tokens are
- * file descriptor numbers and the operating system reuses them, so an entry
- * left behind by a consumer that never released its claim can still be sitting
- * under a number that now belongs to a different drive. This call checks that
- * the descriptor it is handed still refers to what was registered under it,
- * and registers afresh when it does not, so the caller gets the device it
- * asked for rather than a handle onto one that is gone. The check is a strong
- * heuristic and not a guarantee: releasing every claim remains the caller's
- * job, and this only limits the damage of failing to.
- *
  * @return LASER_OK - and only then must laser_release() be called - or
  *         LASER_ERR_NO_SUCH_TOKEN if the device could not be set up.
  */
@@ -280,8 +313,8 @@ laser_status_t laser_acquire(int token);
  * closed.
  *
  * Does NOT close the underlying fd - libusb_wrap_sys_device() never takes
- * ownership of it, and the Kotlin side closes the UsbDeviceConnection itself
- * once the playlist no longer names that descriptor.
+ * ownership of it, and its owner closes it once nothing refers to that
+ * descriptor any more.
  *
  * Safe to call on a token that was never acquired (no-op, logged). Internally
  * serialized against a registration another thread may be performing, so it
@@ -289,13 +322,13 @@ laser_status_t laser_acquire(int token);
  *
  * DROPPING THE LAST CLAIM ALSO CANCELS THE TOKEN. Every operation still
  * running on another thread gives up as soon as it can reach a checkpoint,
- * rather than running out its budgets: the flag is tested between retry
- * attempts and between the chunks of a block read, so the worst case for a
- * wedged drive drops from about a minute - six attempts, each with its own
- * CBW, data and CSW timeouts, plus the delays between them - to roughly one
- * phase timeout. Those operations return LASER_ERR_CANCELLED, distinct from
- * LASER_ERR_IO so a caller unwinding on purpose can tell its own request
- * apart from a drive that failed.
+ * rather than running out its budgets: the flag is tested between retry attempts and between the chunks
+ * of a block read, so the worst case for a wedged drive drops from about a
+ * minute - six attempts, each with its own CBW, data and CSW timeouts, plus
+ * the delays between them - to roughly one phase timeout. Those operations
+ * return LASER_ERR_CANCELLED, distinct from LASER_ERR_IO so a caller
+ * unwinding on purpose can tell its own request apart from a drive that
+ * failed.
  *
  * It does NOT interrupt a libusb_bulk_transfer() already handed to the
  * kernel. Getting to zero would mean libusb's asynchronous API and
@@ -303,11 +336,10 @@ laser_status_t laser_acquire(int token);
  *
  * WHY CANCELLING IS NOT SEPARATELY EXPOSED. The flag is sticky and
  * token-wide, while a claim is one of several. A consumer calling a public
- * cancel would have been disabling the drive for every other consumer of the
- * same token, permanently - reintroducing exactly the teardown-ordering
- * dependency the count exists to remove. Cancelling always means "I am the
- * last one out and I am done", which is what dropping the last claim already
- * says, so that is where it now lives.
+ * cancel would disable the drive for every other consumer of the same token,
+ * permanently - which is exactly the teardown-ordering dependency the count
+ * exists to remove. Cancelling means "I am the last one out and I am done",
+ * which is what dropping the last claim already says.
  *
  * The caller must still guarantee that no transaction is in flight on this
  * token on another thread when the LAST claim is dropped. Nothing inside this
@@ -438,9 +470,8 @@ laser_status_t laser_scsi_cdb(int token,
  *
  * Public because the contract above quotes it: a caller told "you may be
  * blocked here, and then fail" needs the number to decide whether that is
- * survivable. It used to live in the private header, which meant the one
- * documented consequence of a leaked session was expressed by a name the
- * reader could not resolve.
+ * survivable, and a private name would leave the one documented consequence
+ * of a leaked session unresolvable by the reader.
  *
  * A handshake is milliseconds; this is sized for the failure it bounds - a
  * consumer that opened a session and died without closing it. Without a
@@ -484,11 +515,27 @@ void laser_css_session_end(int token, const void *owner);
  * needed, incrementing the LBA and decrementing the remaining count each
  * time, so callers never need to reimplement chunking themselves. Use
  * these instead of laser_scsi_cdb() directly for any read that could
- * span more than one transaction's worth of data (scsi.c's private
- * LASER_MAX_BYTES_PER_TRANSFER, currently 64KB) in one go
- * (dvdnav/dvdread VOBU reads, the Aligned Unit reads libbluray asks the
- * access module for, and the UDF walk disc.c performs to identify a disc
- * all potentially exceed the single-transaction-safe size).
+ * span more than one transaction's worth of data (a private ceiling,
+ * currently 64KB) in one go (dvdnav/dvdread VOBU reads, the Aligned Unit
+ * reads libbluray asks the access module for, and the UDF walk disc.c
+ * performs to identify a disc all potentially exceed the
+ * single-transaction-safe size).
+ *
+ * THE CHUNK SIZE IS NEGOTIATED WITH THE DEVICE, not fixed. Some USB-ATAPI
+ * bridges cannot carry a full 64 KiB data phase and fail the whole command
+ * rather than returning a short one, while the same request split smaller
+ * goes through. So a chunk that comes back LASER_ERR_IO is retried at half
+ * the size, down to a floor, and the size that worked is remembered for that
+ * device for the rest of its registration - by every consumer of the token,
+ * not only the one that discovered it.
+ *
+ * Two consequences worth knowing. A read that would once have failed can now
+ * succeed after spending a few extra commands, so the first read on a
+ * misbehaving bridge is slower than the ones after it. And a genuinely
+ * unreadable sector costs those extra commands too, since a scratched disc
+ * and a weak bridge look identical from here until the smaller transfer is
+ * tried; the retry stops as soon as a chunk is down to one block, where
+ * there is nothing left to split.
  * ============================================================================ */
 
 /**
@@ -591,6 +638,94 @@ typedef enum {
  */
 int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
                          laser_cd_sector_t sector_type, uint8_t *buffer);
+
+/* ============================================================================
+ * DVD region
+ * ========================================================================= */
+
+/**
+ * Does this drive's region setting forbid the disc currently loaded?
+ *
+ * ADVISORY, AND NEVER AN OBSTACLE. A region mismatch stops CSS
+ * authentication and nothing else - an unscrambled disc in a mismatched
+ * drive still plays - so a caller should use this to explain a failure, not
+ * to refuse a disc. Everything uncertain answers 0: a drive that will not
+ * report its RPC state, a non-DVD medium, a drive that enforces nothing
+ * (RPC-1), a drive with no region set yet, and a region-free disc all come
+ * back "no mismatch", because a check that is wrong must not be able to
+ * condemn a disc that would have worked.
+ *
+ * Two commands: REPORT KEY with key format 08h for the drive's RPC state,
+ * and READ DVD STRUCTURE format 01h for the disc's copyright information.
+ * Both are issued only as far as needed - if the drive enforces nothing, the
+ * disc is never asked.
+ *
+ * The masks are "one bit per region, SET means PROHIBITED", as both
+ * structures carry them: a region-1 disc reads 0xFE, a drive set to region 2
+ * reads 0xFD. Drive and disc agree exactly when their permitted sets - the
+ * complements - intersect, which is the comparison this performs. Rendering
+ * either mask as something a person can read is the caller's business; this
+ * hands back the raw bytes so it can.
+ *
+ * WHY THIS IS HERE. It is two hand-built CDBs and one comparison rule, all
+ * three defined by MMC and DVD-Video rather than by any consumer - the same
+ * reason every other command in this header is here rather than in whichever
+ * module needed it first. The access module built these two by hand and was
+ * the last place in this project outside the library doing so.
+ *
+ * @param token       the registry token; a claim must be held.
+ * @param drive_mask  optional, may be NULL. Filled ONLY when this returns
+ *                    non-zero.
+ * @param disc_mask   likewise.
+ * @return non-zero if the drive's region forbids this disc, 0 otherwise -
+ *         including every case where the question could not be answered.
+ */
+int laser_region_mismatch(int token, uint8_t *drive_mask, uint8_t *disc_mask);
+
+/* ============================================================================
+ * Classifying a result
+ * ========================================================================= */
+
+/**
+ * Is @p status a statement about the BLOCKS that were asked for, rather than
+ * about the drive, the medium or the session?
+ *
+ * Three of the error values are positional - LASER_ERR_SCRAMBLED,
+ * LASER_ERR_REGION and LASER_ERR_REFUSED. Each means the drive understood the
+ * request, reached those sectors, and declined to hand them over. Asking for
+ * a different range may well succeed, and asking for the same range again
+ * will not.
+ *
+ * Everything else is not. LASER_ERR_MEDIA_GONE, LASER_ERR_NO_DEVICE and
+ * LASER_ERR_CANCELLED are about the session or the hardware and say nothing
+ * about any sector. LASER_ERR_NO_KEY is
+ * about the authentication state, so the same blocks become readable once a
+ * handshake succeeds - narrowing down which sector is to blame would be
+ * looking for a culprit that does not exist. LASER_ERR_NO_SUCH_TOKEN and
+ * LASER_ERR_INVALID are about the caller.
+ *
+ * LASER_ERR_IO IS DELIBERATELY NOT POSITIONAL, which is the one that could go
+ * either way: a scratched sector produces it, and so does a bridge having a
+ * bad day. It is excluded because the block helpers now negotiate the
+ * transfer size downwards before reporting it (see the chunking section
+ * above), so an I/O error that reaches a caller has already survived the
+ * treatment that would have distinguished the two - and because a caller that
+ * treats it as positional will start recording individual sectors as bad on a
+ * drive whose whole conversation is failing.
+ *
+ * WHY THIS IS HERE rather than in each caller: it is a fact about this
+ * header's enum, and it lives beside the code that decides which sense key
+ * becomes which value. A consumer that classified these itself would be
+ * writing down a rule it does not own, and would not learn about a value
+ * added later - it would silently sort the new one into "not positional".
+ *
+ * @param status Takes an int, not a laser_status_t, because the callers that
+ *        need this hold a value that is either a block count or a status -
+ *        the return of laser_read_blocks(). Any value that is not one of the
+ *        statuses above, including any non-negative count, answers 0.
+ * @return non-zero if positional, 0 otherwise.
+ */
+int laser_status_is_positional(int status);
 
 #ifdef __cplusplus
 }

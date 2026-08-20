@@ -42,14 +42,20 @@ struct scsi_block_input
     struct udfread_block_input base; /* must be first member */
     int token;
 
-    /* Latched once the medium has gone away mid-probe, so the remaining
-     * reads of this probe fail instantly instead of each going back to
-     * the drive to be told the same thing. libudfread walks a fair
+    /* Latched once the medium or the drive has gone away mid-probe, so the
+     * remaining reads of this probe fail instantly instead of each going
+     * back to the drive to be told the same thing. libudfread walks a fair
      * number of structures before it can conclude anything - anchor,
-     * volume descriptor sequence, file set, root directory - and on a
-     * disc that was ejected part-way through, every one of those is a
-     * full transport round trip whose answer is already known. */
-    bool media_gone;
+     * volume descriptor sequence, file set, root directory - and on a disc
+     * ejected or a drive unplugged part-way through, every one of those is a
+     * full transport round trip whose answer is already known.
+     *
+     * BOTH TERMINAL STATUSES LATCH IT. LASER_ERR_NO_DEVICE matters more than
+     * LASER_ERR_MEDIA_GONE here: a drive that has left the bus fails every
+     * command instantly, so libudfread runs its whole walk in a few
+     * milliseconds and the dead commands arrive in a burst rather than one
+     * at a time. */
+    bool gone;
 };
 
 static int udf_read_cb(struct udfread_block_input *bi, uint32_t lba,
@@ -58,7 +64,7 @@ static int udf_read_cb(struct udfread_block_input *bi, uint32_t lba,
     (void) flags;
     struct scsi_block_input *sbi = (struct scsi_block_input *)bi;
 
-    if (sbi->media_gone)
+    if (sbi->gone)
         return -1;
 
     int ret = laser_read_blocks(sbi->token, lba, (int)nblocks, buf);
@@ -73,12 +79,12 @@ static int udf_read_cb(struct udfread_block_input *bi, uint32_t lba,
      * libudfread has no contract for into a library that cannot do
      * anything with it.
      *
-     * LASER_ERR_MEDIA_GONE is the one distinction worth acting on,
-     * and it is acted on here (see media_gone above) rather than passed
-     * up. A short read is not useful either: half a metadata structure
-     * is not a partial answer, it is no answer. */
-    if (ret == LASER_ERR_MEDIA_GONE)
-        sbi->media_gone = true;
+     * The two terminal statuses are the distinction worth acting on, and
+     * they are acted on here (see `gone` above) rather than passed up. A
+     * short read is not useful either: half a metadata structure is not a
+     * partial answer, it is no answer. */
+    if (ret == LASER_ERR_MEDIA_GONE || ret == LASER_ERR_NO_DEVICE)
+        sbi->gone = true;
 
     if (ret != (int)nblocks)
         return -1;
@@ -174,7 +180,7 @@ static udf_video_t detect_udf_video(int token, char *volume_id)
     struct scsi_block_input sbi = {
             .base = { .close = NULL, .read = udf_read_cb, .size = udf_size_cb },
             .token = token,
-            .media_gone = false,
+            .gone = false,
     };
 
     udfread *udf = udfread_init();
@@ -267,20 +273,17 @@ static udf_video_t detect_udf_video(int token, char *volume_id)
  * it through.
  *
  * `base` is the start LBA of the track carrying the filesystem, and every
- * address in this walk is relative to it. It used to be implicitly zero:
- * ISO9660 places its Primary Volume Descriptor at sector 16 OF THE TRACK, and
- * this code read sector 16 of the medium. The two coincide on any disc whose
- * first data track starts at LBA 0, which is every pressed VCD and SVCD - so
- * the assumption held for the discs that mattered and failed silently for the
- * rest.
+ * address in this walk is relative to it. ISO9660 places its Primary Volume
+ * Descriptor at sector 16 OF THE TRACK, not of the medium, and the two
+ * coincide only on a disc whose first data track starts at LBA 0 - every
+ * pressed VCD and SVCD, and not much else. The base comes from the TOC that
+ * read_cd_toc() has already fetched, so addressing the right track costs no
+ * extra command.
  *
- * The base now comes from the TOC that read_cd_toc() has already fetched, so
- * addressing the right track costs no extra command. What this still does not
- * handle is a filesystem in a LATER SESSION of a multi-session disc: format 0
- * of READ TOC reports tracks, not sessions, and finding the last session's
- * first track means READ TOC format 01h - a second command, and a separate
- * change. Such a disc yields LASER_DISC_UNKNOWN, which is the same wrong-free
- * answer it gave before. */
+ * WHAT THIS DOES NOT HANDLE is a filesystem in a LATER SESSION of a
+ * multi-session disc: format 0 of READ TOC reports tracks, not sessions, and
+ * finding the last session's first track means READ TOC format 01h. Such a
+ * disc yields LASER_DISC_UNKNOWN rather than a wrong answer. */
 typedef struct {
     int      token;
     uint32_t base;
@@ -540,16 +543,14 @@ typedef enum {
     CD_TOC_AUDIO,
 } cd_toc_t;
 
-/** Read the medium's table of contents.
+/* Read the medium's table of contents.
  *
- * THREE ANSWERS, NOT TWO, and the third one pays for itself. This used to
- * return a bool meaning "is it an audio CD", which threw away the fact that
- * READ TOC had SUCCEEDED - and that fact is the answer to "is this medium a
- * CD at all". Only a CD can carry the ISO9660 filesystem the Video CD probe
- * looks for, so distinguishing CD_TOC_NONE from CD_TOC_DATA lets
- * laser_disc_identify() skip that probe outright on a DVD or a Blu-ray,
- * rather than spending a PVD read and a root-directory walk to conclude what
- * this command already established.
+ * THREE ANSWERS, NOT TWO, because the success of READ TOC is itself the
+ * answer to "is this medium a CD at all". Only a CD can carry the ISO9660
+ * filesystem the Video CD probe looks for, so distinguishing CD_TOC_NONE from
+ * CD_TOC_DATA lets laser_disc_identify() skip that probe outright on a DVD or
+ * a Blu-ray, rather than spending a PVD read and a root-directory walk to
+ * conclude what this command already established.
  *
  * @param first_data_lba receives the start LBA of the first DATA track, or 0
  *        if there is none. See the ISO9660 walk's use of it: the descriptors

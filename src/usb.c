@@ -82,9 +82,9 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
      * device whose interface 0 is something else - a front-panel HID, a
      * vendor-specific function, a second mass-storage function ordered
      * first - they are not: every transfer then goes to endpoints
-     * belonging to an interface nobody claimed. The Kotlin-side
-     * candidate filter accepts such a device, because it tests the
-     * interface list with `any {}` rather than requiring index 0, so
+     * belonging to an interface nobody claimed. A caller's own candidate
+     * filter may well accept such a device - VLC's does, testing the
+     * interface list rather than requiring index 0 - so
      * nothing upstream rules the case out either.
      *
      * Hence: the interface is chosen HERE, on evidence, and its number

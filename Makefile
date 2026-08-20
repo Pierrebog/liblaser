@@ -1,6 +1,8 @@
 # Makefile: builds liblaser.a and installs it + the public
 # header under $(PREFIX).
 #
+# liblaser - Library for Accessing SCSI External Readers.
+#
 #
 # Layout of this directory:
 #   src/               - our own registry.c / usb.c / bot.c / scsi.c / disc.c
@@ -92,6 +94,8 @@ LASER_PUBLIC_SYMBOLS := \
 	laser_css_session_end \
 	laser_read_blocks \
 	laser_read_cd_blocks \
+	laser_status_is_positional \
+	laser_region_mismatch \
 	laser_disc_identify
 
 # Linux/POSIX backend only.
@@ -258,7 +262,7 @@ liblaser.a: laser-all.o
 
 # -llog is declared here rather than left to whoever links this. Two things
 # in the archive need it and neither is optional: our own registry.c and
-# our own sources log through __android_log_print(), and libusb's core.c does the
+# our own sources log through __android_log_print() on Android, and libusb's core.c does the
 # same because android/config.h defines USE_SYSTEM_LOGGING_FACILITY. A static
 # archive carries no dependency of its own, so a consumer that does not know
 # this fails at final link with __android_log_write undefined - a long way
@@ -279,7 +283,7 @@ install: liblaser.a
 	mkdir -p "$(PREFIX)/include" "$(PREFIX)/lib" "$(PREFIX)/lib/pkgconfig"
 	cp "$(SRC_DIR)/laser.h" "$(SRC_DIR)/laser_disc.h" "$(PREFIX)/include/"
 	cp liblaser.a "$(PREFIX)/lib/"
-	printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${exec_prefix}/lib\nincludedir=$${prefix}/include\n\nName: liblaser\nDescription: Android USB SCSI-MMC transport for optical drives\nVersion: %s\nLibs: -L$${libdir} -llaser -llog\nLibs.private: -llog\nCflags: -I$${includedir}\n' "$(PREFIX)" "$(VERSION)" \
+	printf 'prefix=%s\nexec_prefix=$${prefix}\nlibdir=$${exec_prefix}/lib\nincludedir=$${prefix}/include\n\nName: liblaser\nDescription: Library for Accessing SCSI External Readers - SCSI-MMC over USB to optical drives\nVersion: %s\nLibs: -L$${libdir} -llaser -llog\nLibs.private: -llog\nCflags: -I$${includedir}\n' "$(PREFIX)" "$(VERSION)" \
 		> "$(PREFIX)/lib/pkgconfig/liblaser.pc"
 
 clean:
