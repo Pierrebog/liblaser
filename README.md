@@ -37,13 +37,13 @@ labelled simply *VIDEOCD*, which is the label the disc itself carries.
 
 **Blu-rays** appear as one tile. An unencrypted volume plays as-is. A
 commercial one needs AACS. To enable it, you need to:
-- Place `libaacs.so.0` at `/sdcard/aacs/<abi>/`, grant VLC *All files access*
-  (Android 11 and later) and relaunch it. For security reasons, only files
-  matching whitelisted SHA-256 signatures are accepted. If the installation
-  succedded, the file and <abi> folder are deleted;
-- Place `KEYDB.cfg` at `/sdcard/aacs/KEYDB.cfg`.
+- Install `org.libaacs.provider`, a separate application holding nothing but
+  `libaacs.so.0`;
+- Place `KEYDB.cfg` at `/sdcard/aacs/KEYDB.cfg` and grant VLC *All files
+  access* (Android 11 and later).
 
-**Unplugging** is safe at any time: playback stops and the tile disappears.
+**Unplugging** is safe at any time: playback stops within a couple of seconds,
+with an error, and the tile disappears.
 
 **What is deliberately absent.** Disc entries never enter the media library and
 never appear in *Recent* or *Continue watching*: the fd inside their MRL is
@@ -51,12 +51,12 @@ valid only for the current connection, so a stored one would point at nothing
 or, worse, at something else (§6). Resume-where-you-left-off therefore does not
 apply to discs.
 
+**In case of low DVD framerate,** especially on older arm setup, set hardware
+acceleration to `Disabled` or `Automatic`.
+
 **When something does not play.** The log tag is `Laser` for the transport and
 `VLC/LaserDrive` for the Android side; every transport line carries the drive's
 `vid:pid:bcd`, which is what a bug report needs.
-
-**In case of low DVD framerate,** especially on older arm setup, set hardware
-acceleration to `Disabled` or `Automatic`.
 
 ## 3. Approach
 
@@ -208,6 +208,29 @@ LUN discovery for combo drives, a retry policy keyed on what the command
 actually is, and sense-code classification precise enough to tell a scrambled
 sector from a lost key session from a region mismatch.
 
+**A drive that leaves the bus is told apart from one that is merely failing,
+and remembered.** Unplugging mid-playback used to be indistinguishable from an
+I/O error — which invites a retry — so every read spent its whole budget, six
+attempts over two and a half seconds, rediscovering the same thing. Three
+changes settle it. The condition has its own status, `LASER_ERR_NO_DEVICE`,
+kept apart from `LASER_ERR_IO` precisely because one invites a retry and the
+other must not. It is established even when libusb cannot name it: some
+controllers report a plain I/O error rather than "no device", so a command
+whose CBW could not be handed over on *any* attempt is treated as gone — a
+31-byte transfer that fails six times over several seconds is not a busy
+bridge. And it is **latched on the registration**, so the next command fails
+without touching libusb. A drive pulled during an audio CD now takes under
+three seconds to stop rather than forty, and the demuxer's own limit — sixteen
+consecutive failed reads — is reached at the speed it was written for.
+
+**The transfer-size negotiation serves every consumer, not the one that
+discovered the limit.** It lives in the contrib and acts on the chunk actually
+put on the wire. Held in the access module instead, it protected DVD and
+Blu-ray playback while CD-Audio and Video CD — which reach the drive through
+`cdrom.c` — kept failing on hardware the other path had already tamed; and it
+narrowed a *window* that the contrib then split at 64 KiB anyway, so its first
+two steps reissued a byte-for-byte identical command.
+
 **DVD-Video playback with CSS.** The full authentication handshake runs over
 the USB transport: menus, navigation and feature playback all work. libdvdcss
 is patched at the `ioctl_*` layer only — every function keeps its signature
@@ -241,23 +264,25 @@ stream path, which no CD ever takes. The two sizes never meet.
 **Region mismatch explained rather than suffered.** Before the first read of a
 playback session, the drive's RPC state and the disc's region management
 information are compared, and a mismatch is reported in one sentence naming
-both regions. Silent on a CD, a BD, a region-free disc, an RPC-1 drive, or a
-drive with no region set yet — all of which are cases where the two commands
-simply do not answer, so the check gates itself without being told what is in
-the drive.
+both regions. The two commands and the comparison rule are the contrib's — MMC
+and DVD-Video, not VLC — and what stays in the module is turning two bitmasks
+into something a person can read. Silent on a CD, a BD, a region-free disc, an
+RPC-1 drive, or a drive with no region set yet — all of which are cases where
+the two commands simply do not answer, so the check gates itself without being
+told what is in the drive.
 
-**Getting libaacs onto the device.** libaacs is not shipped inside the
-application, and cannot simply be: libbluray loads it with `dlopen` under the
-name `libaacs.so.0`, and an APK's native library directory holds only files
-named `lib*.so` — a versioned suffix cannot be packaged there. A drop in
-`/sdcard/aacs/<abi>/libaacs.so.0` is therefore copied at first start into the
-application's private storage, checked against a SHA-256 pinned per ABI,
-made read-only before being renamed into place, and preloaded once to prove
-the linker accepts it. libbluray is then pointed at it through `LIBAACS_PATH`,
-which it treats as a path *prefix* and completes with `.so.0` itself — which
-is what lets all of this work without patching libbluray at all. The whole
-mechanism lives in one file and one build flavour, both absent from the
-`vlcBundle` build.
+**Getting libaacs onto the device.** libbluray loads libaacs with `dlopen`
+under the name `libaacs.so.0`, and no APK can put that name on disk: the
+package installer extracts only entries called `lib*.so`. It arrives instead
+in a second application, `org.libaacs.provider`, holding that one file per ABI
+and nothing else — and stays there, mapped out of the package rather than
+copied, `LIBAACS_PATH` holding `/data/app/…/base.apk!/lib/<abi>/libaacs`. The
+dynamic linker has accepted that form for any zip file since API 23, provided
+the entry is stored uncompressed and page-aligned, which is that APK's whole
+packaging discipline; libbluray completes the prefix with `.so.0` itself, so
+it needs no patch. The ABI directory is VLC's own, an APK declaring no
+lib*.so having no primary ABI of its own. Reaching another package at all
+needs `<queries>` naming it in VLC's manifest
 
 **Lifetime of the descriptor.** Two halves, answering different questions.
 Natively, the device registration is **reference-counted**: every consumer
@@ -279,12 +304,18 @@ guards already in `PlaylistManager` were widened to cover laser locations
 rather than duplicated beside them.
 
 Against a claim that is never released anyway, `laser_acquire()` checks that
-the descriptor it is handed still refers to what was registered under that
-number, and registers afresh when it does not. Descriptor numbers are reused
-by the operating system, so an entry outliving its device can otherwise be
-served for a drive that is no longer there. The check is `fstat()` on the
-descriptor itself — a strong heuristic, not a guarantee, and no substitute for
-releasing claims.
+the descriptor it is handed still names the device registered under that
+number, and **refuses** when it does not. Descriptor numbers are reused by the
+operating system, so an entry outliving its device can otherwise be served for
+a drive that is no longer there. Refusing rather than re-registering is the
+only safe answer: an entry lives only while somebody holds it, so a mismatch
+means another consumer still believes it holds this device, and rebuilding the
+registration under the same number would take the drive away from a caller
+that never let go. The value of the check is therefore the error it logs,
+which names the cause — without it the commands simply go to a handle wrapping
+whatever the number has become. The test is `fstat()` on the descriptor
+itself, comparing device and inode — a strong heuristic, not a guarantee, and
+no substitute for releasing claims.
 
 **Throughput.** Reads are windowed and prefetched by a dedicated thread, and
 the transfer size is negotiated per device. Measured on a DVD-9: ~1 MB/s
@@ -299,10 +330,11 @@ seconds. Playback is smooth end to end.
 | Refusals are recorded per LBA, not per session                                                 | A session-wide latch turned one scrambled VOB into end-of-stream for the whole disc, including the unscrambled `.IFO` files behind it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Readable prefix preserved on a refused range                                                   | A refusal applies to the whole SCSI command; a window straddling the boundary between an `.IFO` and its scrambled `.VOB` must not lose the readable part.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | Retry policy keyed on key format, not opcode                                                   | `REPORT KEY` carries both state-changing handshake steps and harmless queries. Retrying an AGID request can exhaust all four AGIDs; refusing to retry a copyright query would disable CSS for the whole disc.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Transfer size negotiated, not configured                                                       | Bridge limits vary and are not discoverable from any descriptor.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Transfer size negotiated, not configured — and negotiated in the contrib                       | Bridge limits vary and are not discoverable from any descriptor. Held in a consumer, the limit is learnt once per consumer: the module that met the bad bridge copes and the others do not. Held here, it also acts on the chunk actually put on the wire rather than on a window the contrib splits anyway.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | A laser MRL never enters a persistent store                                                    | It names a descriptor valid for one connection in one process. Stored, it comes back at the next launch naming a different device, an ordinary file, or nothing — a *wrong* answer rather than a missing one. The existing `fd://` guards in `PlaylistManager` were widened rather than duplicated; the symptom was an offer at startup to resume a disc that had left the building.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | The playback connection's lifetime is reconciled against the playlist, not paired with an open | Pairing leaks whenever one half is missed, and there are many ways to miss it: playback that never starts, a demuxer that rejects the disc, an input error, the app being swiped away. Reconciliation names no exit path, so it cannot miss one. Its one blind spot is a connection just opened and not yet in any playlist, which is indistinguishable from one whose entry has gone — so a fresh connection is spared a bounded number of reconciliations rather than a bounded number of milliseconds: what has to happen first is an event, the playlist being replaced, not the passage of time.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | …and reconciled from events libVLC emits, never from a decision taken in Kotlin                | Every module releases its token in its own `Close()`, so `MediaPlayer.Event.Stopped` is emitted only after the libusb handle has been released. Doing the same work in `stop()` would close a descriptor libusb still held. This is also why no JNI call is needed to make the ordering safe.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| A descriptor is never closed while the native side may still hold it                           | The rule has one non-obvious consequence, which is where it was first broken: closing early does not stop liblaser using the number, it changes what the kernel can say about it. An open descriptor on an absent device answers "no device"; a closed one answers "bad descriptor", which is indistinguishable from a transient fault and invites the retry budget. So `dropDetached()` moves a detached connection aside rather than closing it, and the ordinary reconciliation closes it once nothing names it. |
 | The track number is carried in the CD-Audio MRL, not only in an input option                   | `cdda.c` distinguishes tracks by options; a host that cannot carry options across a sub-item collapses them all onto one MRL and loops forever. The `/Track NN` syntax was already parsed by `DiscOpen()` — nothing emitted it. Emitted only where it round-trips, i.e. where `DiscOpen()` reads the location rather than a file path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | The drive's region is read, never set                                                          | `SEND KEY` format 06h would set it, and the counter of permitted changes is small and, once exhausted, permanent. A drive bricked into one region by a media player the user did not think was making that decision is a worse outcome than a disc that will not play. The check is advisory and cannot refuse a disc.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | A DVD is listed twice, with menus and without                                                  | dvdnav is the right default — it is what the disc's author intended and what a DVD player does. But a disc whose navigation it cannot follow plays as a black screen through it and plays fine through the plain reader, and which of the two a given disc needs is a judgement only the person watching can make. So it is offered as a second row rather than guessed at, or buried in a long-press menu. The cost was a stream-based `demux` submodule in `dvdread.c`, which had only ever been an `access_demux` — reachable by name (`dvdsimple`) and never probed, so that "no menus" is asked for and never inferred.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -317,7 +349,7 @@ seconds. Playback is smooth end to end.
 | Nothing but `laser_*` leaves `liblaser.a`                                                      | libbluray bundles its own copy of libudfread, exporting the same `udfread_*` names, and an Android VLC links both archives — so which copy satisfies a given reference becomes a property of archive member ordering. The three object sets are therefore partially linked into one relocatable object, and everything outside the documented API is demoted to local. Per-object `objcopy` cannot do this: localizing `laser_lookup()` in `registry.o` would break `scsi.o`, `laser_bot_send_locked()` crosses from `bot.o` to `scsi.o`, and libusb's files call into each other throughout. The link step asserts both directions — that nothing foreign escaped, and that every declared entry point is actually defined, since `objcopy --keep-global-symbol=` on a name that does not exist is ignored without a word.                                                                                                                                                                                                                                                                                                     |
 | Cancellation belongs to the last release, not to a public call                                 | The flag is sticky and token-wide, while a claim is one of several: a public cancel would let one consumer disable the drive for every other holder of the same token, permanently — reintroducing exactly the teardown-ordering dependency the count exists to remove. Cancelling always meant "I am the last one out and I am done", which is what dropping the last claim already says, so that is where it lives. Sticky removes the question of who clears it, the slot being memset moments later. Checked between attempts and between chunks, never inside a transfer already in flight. What not exposing it costs: a `Close()` whose read-ahead worker sits inside a block read on a wedged drive now waits out a full retry budget rather than one phase timeout, `b_quit` being read only between two reads. Getting to zero means libusb's asynchronous API.                                                                                                                                                                                                                                                       |
 | Diagnostics go through a callback                                                              | A library that has decided where its logs go has decided it for every application that embeds it. `laser_set_log_cb()` defaults to Android's logger, which is right inside the app and useless — and unsilenceable — anywhere else. Same shape as libbluray's `bd_set_debug_handler()`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| libbluray reaches libaacs by `dlopen`, so the application installs it rather than packaging it | libbluray does not link libaacs; it opens `libaacs.so.0` at runtime. An APK cannot carry that name — only `lib*.so` is packaged — so no amount of building libaacs into the application would let libbluray find it. `LIBAACS_PATH` is the seam libbluray already offers, and it holds a path *prefix* that libbluray completes with `.so.0`, which is what makes an installed copy reachable without patching libbluray. The copy is hashed against a per-ABI pin after being copied and before being renamed into place, so what is verified is the private copy and not the shared-storage file that could change between the two.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| libbluray reaches libaacs by `dlopen`, so a second package carries it and VLC never copies it  | libbluray does not link libaacs; it opens `libaacs.so.0` at runtime, and nothing can put that name on disk — the installer extracts only `lib*.so`. So the library cannot ship inside VLC, and it cannot be extracted from any other APK either. What it can do is stay inside an APK that is never extracted at all: `LIBAACS_PATH` holds `…/base.apk!/lib/<abi>/libaacs`, libbluray appends `.so.0`, and the linker maps the entry straight out of the provider's package. VLC writes nothing and holds no copy, which is what keeps it out of the business of distributing a libaacs binary: it names a file inside a package somebody else installed. The same `.so` suffix rule bites three times on the way there — in the installer, in `zipalign -p`, and in `apksigner` — which is why the provider APK is built by hand rather than by Gradle (§7). |
 | libaacs' key cache goes to private storage, its key database does not                          | `file_get_cache_home()` would otherwise put the keys libaacs derives beside `KEYDB.cfg` in shared storage, readable by any application holding *All files access* and surviving the uninstall. The two directories are asymmetric on purpose: a human has to be able to drop the database in, and nothing has to be able to read the cache out. `XDG_CACHE_HOME` is the redirection libaacs already honours, so it costs one `setenv` and no patch.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | One tile group per drive, ordered by device name                                               | The browser used to stop at the first drive holding a disc, which meant a second drive was never even classified. Classification is now queued and serial — two overlapping passes would stack two system permission dialogs — but nothing is dropped, which removes the hand-rolled re-entry that used to catch the candidates the previous gate turned away. Display order comes from sorting device names rather than from arrival, since arrival order depends on which permission dialog the user answers first and would move a disc's tiles between two launches.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
@@ -335,23 +367,15 @@ seconds. Playback is smooth end to end.
   check reads as a short read; `0xF8` is the fix if that ever shows up.
 - **Commercial Blu-ray from a key database.** Every piece is now in place and
   none of them has met a disc. libaacs can find `KEYDB.cfg` on Android (§5),
-  the application installs `libaacs.so.0` where libbluray's `dlopen` will find
-  it (§5), and libbluray reads the volume through the access module. What has
-  never been exercised is the join: whether libbluray actually opens the
-  installed library on a device, whether the key in a real database matches a
-  real disc, and whether an AACS volume then decrypts through this transport.
-  Testing it needs a commercial Blu-ray, a key database, a libaacs build whose
-  fingerprint is pinned, and *All files access* granted to VLC — and the
-  fingerprint table currently holds placeholders, so this cannot be tried at
-  all until somebody publishes the binaries it is meant to pin.
-
-  Two things are worth knowing before the first attempt. libbluray's own
-  diagnostics go to `stderr`, which is `/dev/null` on Android — the same
-  problem the libaacs patch fixes for libaacs — so if the library is not found
-  there will be no message saying so; the installer's own log lines are the
-  only trace. And a failure here is at least four candidates deep: the drop,
-  the fingerprint, the `dlopen`, the key. Working through them in that order
-  costs less than guessing.
+  libbluray reads the volume through the access module, and the provider APK
+  demonstrably loads — a device log shows `nativeloader` mapping
+  `libaacs.so.0` out of `org.libaacs.provider`'s package into VLC's namespace,
+  which settles the packaging on its own. What has never been exercised is the
+  join: whether libbluray's own `dlopen` finds what a test load found, whether
+  the key in a real database matches a real disc, and whether an AACS volume
+  then decrypts through this transport. Testing it needs a commercial Blu-ray,
+  a key database, the provider installed, and *All files access* granted to
+  VLC.
 
 ### Functional
 
@@ -388,21 +412,6 @@ seconds. Playback is smooth end to end.
   last — is classified as audio, which is the useful answer. The correct
   handling of a true mixed-mode disc is ambiguous enough (play the audio
   tracks? mount the data track?) that guessing would be worse.
-
-### Separable for upstream
-
-Two pieces stand on their own and mention neither USB nor this project.
-
-**The `cdda.c` change.** It fixes a class of problem — a host that cannot carry
-input options across a sub-item — of which VLC-Android is one case, and it
-mentions nothing about USB or Android. It is proposable independently of
-everything else here, and is the easiest piece to get accepted.
-
-**The libaacs Android patch.** Pure platform portability, keyed on `*android*`
-in `configure.ac` and useful to any Android application linking libaacs. Two
-fixes: no `$HOME` or XDG variables, so `dirs_xdg.c` silently finds no
-`KEYDB.cfg` — `dirs_android.c` resolves one shared-storage root under four
-names; and stderr on `/dev/null`, so `BD_DEBUG` now also reaches logcat.
 
 ## 8. Reference documents
 

@@ -198,6 +198,21 @@ typedef struct {
      * and sees it on the next. */
     int device_gone;
 
+    /* Identity of the descriptor this entry was registered on, as reported by
+     * fstat() at registration.
+     *
+     * WHAT IT DETECTS: a descriptor number reused by the operating system for
+     * something else while an entry still refers to it. That can only happen
+     * when a claim was never released, which is a lifecycle bug upstream - but
+     * the consequence of not noticing is worse than the bug: commands go to a
+     * handle wrapping whatever the number now names.
+     *
+     * A HEURISTIC, not a guarantee. usbfs allocates inode numbers and may
+     * reuse one after its node is destroyed, so a match is strong evidence
+     * and not proof. It is no substitute for releasing claims. */
+    dev_t reg_dev;
+    ino_t reg_ino;
+
     /* Dedicated libusb context for this device - deliberately NOT the
      * shared default (NULL) context. A playback session can be open for
      * hours, with reads driven directly by libVLC's own internal

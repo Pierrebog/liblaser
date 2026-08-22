@@ -302,8 +302,19 @@ typedef enum {
  * consumer that cannot get the drive learns it while it can still fail
  * cleanly.
  *
+ * A RECYCLED DESCRIPTOR IS REFUSED. Before handing back an entry that already
+ * exists, this checks that @p token still names the device it was registered
+ * on. It cannot name a different one unless a claim was never released - an
+ * entry lives only while somebody holds it - so a mismatch is a lifecycle bug
+ * upstream, and refusing is the only safe answer to it: re-registering would
+ * mean tearing a live registration down under a consumer that never let go.
+ * The failure is logged at error level and names its cause, which is the
+ * whole value of the check; without it the commands would simply go to a
+ * handle wrapping whatever that number has become.
+ *
  * @return LASER_OK - and only then must laser_release() be called - or
- *         LASER_ERR_NO_SUCH_TOKEN if the device could not be set up.
+ *         LASER_ERR_NO_SUCH_TOKEN if the device could not be set up, or if
+ *         the descriptor no longer names the device registered under it.
  */
 laser_status_t laser_acquire(int token);
 

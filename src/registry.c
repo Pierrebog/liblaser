@@ -49,6 +49,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #ifdef __ANDROID__
@@ -292,6 +293,17 @@ static int laser_register(int fd)
     if (entry == NULL) {
         LOGW("register(fd=%d): already registered, or table full", fd);
         return -1;
+    }
+
+    /* Identity of the descriptor, for the recycling check in laser_acquire().
+     * A failure here is not fatal: zeroes never match a real fstat(), so the
+     * check degrades to "always suspect" rather than to "always trust". */
+    struct stat st;
+    if (fstat(fd, &st) == 0) {
+        entry->reg_dev = st.st_dev;
+        entry->reg_ino = st.st_ino;
+    } else {
+        LOGW("register(fd=%d): fstat failed, identity check disabled", fd);
     }
 
     /* Full size until something proves otherwise. The slot was memset by
@@ -767,6 +779,20 @@ static void teardown_entry_locked(laser_entry_t *entry)
     LOGI("release(token=%d): device torn down", token);
 }
 
+/* Does @p fd still name what this entry was registered on?
+ *
+ * See laser_entry_t::reg_dev. */
+static int fd_still_ours(const laser_entry_t *entry, int fd)
+{
+    struct stat st;
+
+    if (fstat(fd, &st) != 0) {
+        return 0;
+    }
+
+    return st.st_dev == entry->reg_dev && st.st_ino == entry->reg_ino;
+}
+
 laser_status_t laser_acquire(int token)
 {
     /* ONE CRITICAL SECTION, covering the lookup, the registration if there
@@ -779,6 +805,20 @@ laser_status_t laser_acquire(int token)
     pthread_mutex_lock(&g_registry_lock);
 
     laser_entry_t *entry = laser_lookup(token);
+
+    /* The descriptor may have been recycled since this entry was registered.
+     * REFUSED RATHER THAN RE-REGISTERED, which is the only safe answer here:
+     * an entry exists only while somebody holds it, so a mismatch means
+     * another consumer still believes it holds this device, and tearing its
+     * registration down to build a new one under the same number would take
+     * the drive away from a caller that never let go. */
+    if (entry != NULL && !fd_still_ours(entry, token)) {
+        pthread_mutex_unlock(&g_registry_lock);
+        LOGE("acquire(token=%d): the descriptor no longer names the device "
+             "registered under it - a claim was never released", token);
+        return LASER_ERR_NO_SUCH_TOKEN;
+    }
+
     if (entry == NULL) {
         /* Result checked via the lookup rather than the return value: what
          * matters to this function is whether an entry exists afterwards, and
