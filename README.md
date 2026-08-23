@@ -2,7 +2,7 @@
 
 ## 1. Goal
 
-Let VLC on Android play optical discs — CD-Audio, Video CD, DVD-Video and
+Let VLC for Android play optical discs — CD-Audio, Video CD, DVD-Video and
 Blu-ray — from a USB drive attached to the phone or Smart TV Box, on unrooted
 stock Android, and on **any hardware that conforms to the applicable
 standards** rather than on a list of blessed models.
@@ -37,7 +37,7 @@ labelled simply *VIDEOCD*, which is the label the disc itself carries.
 
 **Blu-rays** appear as one tile. An unencrypted volume plays as-is. A
 commercial one needs AACS. To enable it, you need to:
-- Install `org.libaacs.provider`, a separate application holding nothing but
+- Install `libaacs-provider.apk`, a separate application holding nothing but
   `libaacs.so.0`;
 - Place `KEYDB.cfg` at `/sdcard/aacs/KEYDB.cfg` and grant VLC *All files
   access* (Android 11 and later).
@@ -284,38 +284,24 @@ it needs no patch. The ABI directory is VLC's own, an APK declaring no
 lib*.so having no primary ABI of its own. Reaching another package at all
 needs `<queries>` naming it in VLC's manifest
 
-**Lifetime of the descriptor.** Two halves, answering different questions.
-Natively, the device registration is **reference-counted**: every consumer
-declares itself with `laser_acquire()` and drops out with `laser_release()`,
-and the USB handle is closed when the last claim goes rather than when the
-first consumer finishes. Playing a DVD means the access module and libdvdcss
-hold the same token at the same time, and before the count existed the
-correctness of that rested on libVLC closing the demuxer before the access —
-an ordering libVLC provides and does not promise. On the Java side, the
-classification connection is opened and closed within one call, while the
-playback connection is owned by `LaserConnections` and closed when the
-playlist no longer names its descriptor — reconciled from
-`MediaPlayer.Event.Stopped` in `PlaylistManager`, and from the service's own
-teardown, which is also the backstop against a claim that is never released. A
-connection just opened is spared the next few reconciliations, since the
-playlist that will name it does not exist yet (§6). Nothing that names a
-descriptor reaches the medialibrary or the resume preferences: the `fd://`
-guards already in `PlaylistManager` were widened to cover laser locations
-rather than duplicated beside them.
+**Lifetime of the descriptor.** Natively the registration is
+**reference-counted**: the USB handle closes when the last claim goes, not
+when the first consumer finishes. A DVD has the access module and libdvdcss
+holding the same token, so without the count correctness would rest on libVLC
+closing the demuxer first — an ordering it provides and does not promise. On
+the Java side a classification connection is opened and closed within one
+call, while a playback connection belongs to `LaserConnections` and closes
+once no playlist names its descriptor, reconciled from
+`MediaPlayer.Event.Stopped` and from the service's teardown. A just-opened one
+is spared the next few reconciliations (§6). No location naming a descriptor
+reaches the medialibrary or the resume preferences.
 
-Against a claim that is never released anyway, `laser_acquire()` checks that
-the descriptor it is handed still names the device registered under that
-number, and **refuses** when it does not. Descriptor numbers are reused by the
-operating system, so an entry outliving its device can otherwise be served for
-a drive that is no longer there. Refusing rather than re-registering is the
-only safe answer: an entry lives only while somebody holds it, so a mismatch
-means another consumer still believes it holds this device, and rebuilding the
-registration under the same number would take the drive away from a caller
-that never let go. The value of the check is therefore the error it logs,
-which names the cause — without it the commands simply go to a handle wrapping
-whatever the number has become. The test is `fstat()` on the descriptor
-itself, comparing device and inode — a strong heuristic, not a guarantee, and
-no substitute for releasing claims.
+Against a claim never released, `laser_acquire()` **refuses** a descriptor
+that no longer names the device registered under that number — `fstat()` on
+device and inode, since numbers get reused. Re-registering instead would take
+the drive from a consumer that still believes it holds it, an entry living
+only while somebody holds it. The value is the error it logs, which names the
+cause: a strong heuristic, no substitute for releasing claims.
 
 **Throughput.** Reads are windowed and prefetched by a dedicated thread, and
 the transfer size is negotiated per device. Measured on a DVD-9: ~1 MB/s
@@ -334,7 +320,7 @@ seconds. Playback is smooth end to end.
 | A laser MRL never enters a persistent store                                                    | It names a descriptor valid for one connection in one process. Stored, it comes back at the next launch naming a different device, an ordinary file, or nothing — a *wrong* answer rather than a missing one. The existing `fd://` guards in `PlaylistManager` were widened rather than duplicated; the symptom was an offer at startup to resume a disc that had left the building.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | The playback connection's lifetime is reconciled against the playlist, not paired with an open | Pairing leaks whenever one half is missed, and there are many ways to miss it: playback that never starts, a demuxer that rejects the disc, an input error, the app being swiped away. Reconciliation names no exit path, so it cannot miss one. Its one blind spot is a connection just opened and not yet in any playlist, which is indistinguishable from one whose entry has gone — so a fresh connection is spared a bounded number of reconciliations rather than a bounded number of milliseconds: what has to happen first is an event, the playlist being replaced, not the passage of time.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | …and reconciled from events libVLC emits, never from a decision taken in Kotlin                | Every module releases its token in its own `Close()`, so `MediaPlayer.Event.Stopped` is emitted only after the libusb handle has been released. Doing the same work in `stop()` would close a descriptor libusb still held. This is also why no JNI call is needed to make the ordering safe.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| A descriptor is never closed while the native side may still hold it                           | The rule has one non-obvious consequence, which is where it was first broken: closing early does not stop liblaser using the number, it changes what the kernel can say about it. An open descriptor on an absent device answers "no device"; a closed one answers "bad descriptor", which is indistinguishable from a transient fault and invites the retry budget. So `dropDetached()` moves a detached connection aside rather than closing it, and the ordinary reconciliation closes it once nothing names it. |
+| A detached drive's connection is closed at once rather than left to the ordinary reconciliation | The cache is keyed by `deviceName` — `/dev/bus/usb/001/004` — and that path is REASSIGNED, so a replugged drive landing on the same bus and address finds its own stale entry and `open()` hands back a connection to a device that has gone. Reconciliation does not cover this: it is driven by the playlist, so an entry keeps a connection alive for as long as something names it, drive present or not. Hence `dropDetached()`, on `ACTION_USB_DEVICE_DETACHED`, and hence closing rather than parking: a parked connection has no second owner to close it, and the entry has already left the map that reconciliation walks. The cost is real and is paid where §5 already collects it: closing does not stop liblaser using the number, it changes what the kernel says about it — an open descriptor on an absent device answers "no device", a closed one answers "bad descriptor", which on its own reads as a transient fault and invites the retry budget. What tells the two apart here is not the error code but the other arm of `LASER_ERR_NO_DEVICE`: a command whose CBW could not be handed over on *any* attempt is treated as gone whatever libusb called it. So the drive is still distinguished from one that is merely failing, by the route that was written for controllers which misreport it. |
 | The track number is carried in the CD-Audio MRL, not only in an input option                   | `cdda.c` distinguishes tracks by options; a host that cannot carry options across a sub-item collapses them all onto one MRL and loops forever. The `/Track NN` syntax was already parsed by `DiscOpen()` — nothing emitted it. Emitted only where it round-trips, i.e. where `DiscOpen()` reads the location rather than a file path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | The drive's region is read, never set                                                          | `SEND KEY` format 06h would set it, and the counter of permitted changes is small and, once exhausted, permanent. A drive bricked into one region by a media player the user did not think was making that decision is a worse outcome than a disc that will not play. The check is advisory and cannot refuse a disc.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | A DVD is listed twice, with menus and without                                                  | dvdnav is the right default — it is what the disc's author intended and what a DVD player does. But a disc whose navigation it cannot follow plays as a black screen through it and plays fine through the plain reader, and which of the two a given disc needs is a judgement only the person watching can make. So it is offered as a second row rather than guessed at, or buried in a long-press menu. The cost was a stream-based `demux` submodule in `dvdread.c`, which had only ever been an `access_demux` — reachable by name (`dvdsimple`) and never probed, so that "no menus" is asked for and never inferred.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -357,14 +343,14 @@ seconds. Playback is smooth end to end.
 
 ### Cheap to settle
 
-- **Unencrypted Blu-ray.** A BDMV volume without AACS should play as-is, since
-  libbluray reads through the access module. This is a test, not a
-  development.
 - **Video CD, on real hardware.** Written and verified piecewise, never through
   a drive. Watch the `READ CD` flags: Mode 2 Form 2 is asked for without EDC/ECC
   (byte 9 = `0xF0`), as VLC's own BSD backend has long done. A drive that counts
   the four EDC bytes anyway returns 2348 per sector, which the strict length
   check reads as a short read; `0xF8` is the fix if that ever shows up.
+- **Unencrypted Blu-ray.** A BDMV volume without AACS should play as-is, since
+  libbluray reads through the access module. This is a test, not a
+  development.
 - **Commercial Blu-ray from a key database.** Every piece is now in place and
   none of them has met a disc. libaacs can find `KEYDB.cfg` on Android (§5),
   libbluray reads the volume through the access module, and the provider APK

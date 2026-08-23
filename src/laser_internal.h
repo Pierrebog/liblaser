@@ -425,17 +425,18 @@ void laser_mass_storage_reset(laser_entry_t *entry);
 /**
  * Wake the drive and wait for its medium to become ready (TEST UNIT READY
  * in a loop), before any read is attempted on it. Called once at
- * registration, before LUN discovery, since a cold drive must be spun up
- * before it will answer commands reliably. Best-effort: a drive that
- * never reports ready still falls through.
+ * registration, AFTER laser_probe_lun() and only when that probe got an
+ * answer - see its doc below for why the order is that way round, and
+ * registry.c for why silence is a reason to skip the wait rather than to
+ * spend it. Best-effort otherwise: a drive that never reports ready still
+ * falls through, and is still registered.
  *
  * BOUNDED IN REAL TIME, which matters to the caller: this is the slowest
- * step of registration, it runs with the registry's lazy-registration
- * lock held, and it is not cancellable from outside. Its ceiling is
- * LASER_SPINUP_MAX_WALL_MS (15s), reached only by a drive that has
- * stopped answering; a working drive, present or empty, returns in well
- * under a second. See the implementation in scsi.c for the full
- * rationale and both budgets.
+ * step of registration, it runs with the registry lock held, and it is not
+ * cancellable from outside. Its ceiling is LASER_SPINUP_MAX_WALL_MS (15s),
+ * reached only by a drive that has stopped answering; a working drive,
+ * present or empty, returns in well under a second. See the implementation
+ * in scsi.c for the full rationale and both budgets.
  */
 void laser_wait_until_ready(laser_entry_t *entry);
 

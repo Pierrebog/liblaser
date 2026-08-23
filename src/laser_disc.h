@@ -84,8 +84,12 @@ typedef struct {
      * Identifier, trimmed of the trailing spaces that field is padded with
      * - and frequently generic, a great many VCDs being labelled simply
      * VIDEOCD. That is the disc's own label rather than a failure to find a
-     * better one, and the fallback advice below covers it. For an audio CD
-     * it is ALWAYS empty: a Red Book disc has no filesystem and therefore
+     * better one, and the fallback advice below covers it. An ISO9660 label
+     * that is not printable ASCII is reported EMPTY rather than converted:
+     * the field records no encoding, so a disc mastered outside ASCII
+     * cannot be read back without guessing which one it used, and a
+     * confidently wrong name is worse than none. For an audio CD it is
+     * ALWAYS empty: a Red Book disc has no filesystem and therefore
      * no label - a name for one has to come from CD-TEXT or from a metadata
      * service, neither of which is this library's business.
      *

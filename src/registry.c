@@ -568,22 +568,31 @@ static int laser_register(int fd)
  * halves. The caller then incremented refs on a slot that had just been
  * memset - or, worse, one already handed to a different fd.
  *
- * Renamed from g_registry_lock along with the removal of the lazy path
- * it was named for. */
+ * Renamed TO g_registry_lock when the lazy path its previous name referred
+ * to was removed: it guards registration, not a special case of it. */
 static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---------------------------------------------------------------------------
  * CSS authentication sessions - contract in laser.h.
  *
- * LOCK ORDER, total, acquire left to right only:
+ * LOCK ORDER. Three nestings occur, and all three have g_registry_lock on
+ * the outside:
  *
- *     g_registry_lock  >  io_lock  >  css_mtx  >  g_table_lock
+ *     g_registry_lock  >  io_lock        (setup: LUN probe, spin-up wait)
+ *     g_registry_lock  >  css_mtx        (teardown: is a session open?)
+ *     g_registry_lock  >  g_table_lock   (publish an entry, release a slot)
  *
- * css_mtx is never held across io_lock or g_registry_lock: begin()
- * finishes its lookup (which may take g_registry_lock) BEFORE touching
- * css_mtx, and the transport's session check takes css_mtx and releases it
- * before locking io_lock. A session being "open" for hours is a flag, not a
- * held lock, which is what lets it outlive any single call.
+ * The other three pairs never nest AT ALL, in either direction, and that is
+ * a stronger property than an order between them - so do not read the list
+ * above as a chain and infer, say, that css_mtx may be taken under io_lock.
+ * Nothing does that, and nothing should start.
+ *
+ * The pair worth naming is css_mtx and io_lock, because one call touches
+ * both: laser_scsi_cdb() takes css_mtx for the session check and RELEASES
+ * it before locking io_lock. Likewise begin() finishes its lookup - which
+ * may take g_registry_lock - before touching css_mtx. A session being
+ * "open" for hours is a flag, not a held lock, which is what lets it
+ * outlive any single call.
  * ------------------------------------------------------------------------- */
 
 int laser_cdb_changes_css_state(const uint8_t *cdb, int cdb_len)

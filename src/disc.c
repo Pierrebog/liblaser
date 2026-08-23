@@ -435,6 +435,39 @@ typedef enum {
     ISO_VIDEO_SVCD,
 } iso_video_t;
 
+/** Is this Volume Identifier safe to hand out as laser_disc_t::volume_id?
+ *
+ * laser_disc.h promises UTF-8, and on the UDF side copy_volume_id() only has
+ * to worry about where it cuts, the source being UTF-8 already. ISO9660
+ * offers no such guarantee. ECMA-119 restricts this field to d-characters -
+ * A-Z, 0-9 and underscore - so a conformant label is ASCII and needs no
+ * conversion at all; but plenty of pressed discs ignore that and write
+ * whatever their mastering tool's locale produced, and those bytes are not
+ * UTF-8. The consumer that reads them hands them to a Java String, which is
+ * the failure copy_volume_id() exists to prevent, reached by the other door.
+ *
+ * REFUSED WHOLE rather than transcoded or stripped, because there is nothing
+ * to transcode FROM: the descriptor records no encoding, and Latin-1,
+ * Shift-JIS and the rest are indistinguishable at this level. (Joliet's
+ * UCS-2 names live in a supplementary volume descriptor, not in this one, so
+ * they are not an answer here either.) Guessing produces a label that is
+ * confidently wrong, and dropping the offending bytes produces half a name -
+ * while no name at all is a case laser_disc.h already tells callers to
+ * handle, and tells them is not an error.
+ *
+ * Control bytes go the same way. They are valid UTF-8 but they are not a
+ * label, and an embedded NUL would silently cut one short downstream. */
+static bool iso_volume_id_is_printable_ascii(const uint8_t *p, unsigned len)
+{
+    for (unsigned i = 0; i < len; i++)
+    {
+        if (p[i] < 0x20 || p[i] > 0x7E)
+            return false;
+    }
+
+    return true;
+}
+
 /** Walks the medium's ISO9660 filesystem once and answers for both Video CD
  * kinds, filling volume_id (caller-allocated, LASER_DISC_VOLUME_ID_MAX
  * bytes) when something was recognised.
@@ -520,6 +553,15 @@ static iso_video_t detect_iso_video(const iso_ctx_t *ctx, char *volume_id)
     unsigned len = 32;
     while (len > 0 && (pvd[40 + len - 1] == ' ' || pvd[40 + len - 1] == '\0'))
         len--;
+
+    if (!iso_volume_id_is_printable_ascii(pvd + 40, len))
+    {
+        /* Refused, not truncated - see the predicate. The identification
+         * still stands: this is a VCD or an SVCD either way, and the label
+         * is the only thing lost. */
+        volume_id[0] = '\0';
+        return kind;
+    }
 
     memcpy(volume_id, pvd + 40, len);
     volume_id[len] = '\0';
