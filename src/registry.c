@@ -277,6 +277,19 @@ static void release_slot(laser_entry_t *slot)
     pthread_mutex_unlock(&g_table_lock);
 }
 
+static const char *speed_name(int speed)
+{
+    switch (speed) {
+        case LIBUSB_SPEED_UNKNOWN:  return "unknown to the OS";
+        case LIBUSB_SPEED_LOW:      return "low, 1.5Mbps";
+        case LIBUSB_SPEED_FULL:     return "full, 12Mbps";
+        case LIBUSB_SPEED_HIGH:     return "high, 480Mbps";
+        case LIBUSB_SPEED_SUPER:    return "super, 5Gbps";
+        case LIBUSB_SPEED_SUPER_PLUS: return "super+, 10Gbps";
+        default:                    return "unrecognised";
+    }
+}
+
 /** Does the actual one-time device setup: wraps fd with a dedicated
  * libusb context, works out WHICH interface carries the Bulk-Only
  * function and where its endpoints are (interface 0 is not assumed - see
@@ -407,8 +420,8 @@ static int laser_register(int fd)
     LOGI("register(fd=%d): usb %04x:%04x bcd %04x", fd,
          entry->vid, entry->pid, entry->bcd_device);
 
-    LOGI("register(fd=%d): link speed %d (1=full 12Mbps, 2=high 480Mbps, 3=super)",
-         fd, libusb_get_device_speed(libusb_get_device(entry->handle)));
+    int speed = libusb_get_device_speed(libusb_get_device(entry->handle));
+    LOGI("register(fd=%d): link speed %d (%s)", fd, speed, speed_name(speed));
 
     /* Interface selection comes FIRST, before anything is claimed: which
      * interface to claim is its result, not its precondition. Reading the
