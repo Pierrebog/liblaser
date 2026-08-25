@@ -122,9 +122,9 @@
  * from a full stop is mechanical and slow - commonly a few seconds, up to
  * ten or more on a sluggish drive or a marginal disc - so the first
  * contact with the device waits far longer, but only once per session.
- * 20 x 500ms = 10s, which cleared spin-up on the POC's test hardware with
+ * 30 x 500ms = 15s, which cleared spin-up on the POC's test hardware with
  * margin to spare. */
-#define LASER_SPINUP_MAX_ATTEMPTS  20
+#define LASER_SPINUP_MAX_ATTEMPTS  30
 #define LASER_SPINUP_DELAY_MS      500
 
 /* Hard ceiling on the wall-clock time the spin-up wait may consume,
