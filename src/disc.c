@@ -131,51 +131,91 @@ static uint32_t udf_size_cb(struct udfread_block_input *bi)
     return 0;
 }
 
-/* What a single pass over the disc's UDF filesystem concluded. */
-typedef enum {
-    UDF_VIDEO_NONE = 0,   /* no UDF, or UDF with neither layout on it */
-    UDF_VIDEO_DVD,
-    UDF_VIDEO_BD,
-} udf_video_t;
-
-/** Is this really a DVD-Video, or merely a disc with a VIDEO_TS directory?
+/* What a single pass over the disc's UDF filesystem concluded.
  *
- * The presence of the file is not the answer: a data disc can carry a
- * VIDEO_TS folder holding anything at all. What settles it is the first
- * twelve bytes of VIDEO_TS.IFO, which a Video Manager must open with -
- * the same check libdvdread performs at open time, so agreeing with it
- * here is agreeing with whether the disc will actually play. */
-static bool udf_is_dvd_video(udfread *udf)
+ * Named for the filesystem rather than for video, because a DVD-Audio disc
+ * is one of its answers: the walk reports what the UDF volume carries, and
+ * two of the four things it can carry are not video. */
+typedef enum {
+    UDF_DISC_NONE = 0,    /* no UDF, or UDF with no known layout on it */
+    UDF_DISC_DVD_VIDEO,   /* a Video zone and no Audio zone */
+    UDF_DISC_DVD_AUDIO,   /* an Audio zone and no Video zone */
+    UDF_DISC_DVD_UNIVERSAL,  /* both zones */
+    UDF_DISC_BD,
+} udf_disc_t;
+
+#define UDF_ZONE_MAGIC_LEN 12
+
+/** Is this really the named DVD zone, or merely a disc with the directory?
+ *
+ * The presence of the directory is not the answer, and for the Audio zone
+ * that is not a hypothetical: a great many pressed DVD-VIDEO discs carry an
+ * EMPTY /AUDIO_TS directory, because the earliest players expected to find
+ * one. Testing the directory - or even testing that the manager file opens
+ * - would classify most of the DVD-Videos in existence as universal discs
+ * and offer each of them an audio row leading nowhere.
+ *
+ * What settles it is the first twelve bytes of the zone's manager file,
+ * which a Video Manager and an Audio Manager must respectively open with -
+ * the same check libdvdread performs at open time, so agreeing with it here
+ * is agreeing with whether the disc will actually play.
+ *
+ * @param path  the zone's manager file, absolute on the UDF volume
+ * @param magic its identifier, exactly UDF_ZONE_MAGIC_LEN bytes */
+static bool udf_zone_present(udfread *udf, const char *path, const char *magic)
 {
-    UDFFILE *f = udfread_file_open(udf, "/VIDEO_TS/VIDEO_TS.IFO");
+    UDFFILE *f = udfread_file_open(udf, path);
     if (f == NULL)
         return false;
 
-    char magic[12];
-    ssize_t got = udfread_file_read(f, magic, sizeof(magic));
+    char buf[UDF_ZONE_MAGIC_LEN];
+    ssize_t got = udfread_file_read(f, buf, sizeof(buf));
     udfread_file_close(f);
 
-    return got == (ssize_t)sizeof(magic)
-        && memcmp(magic, "DVDVIDEO-VMG", sizeof(magic)) == 0;
+    return got == (ssize_t)sizeof(buf)
+        && memcmp(buf, magic, sizeof(buf)) == 0;
 }
 
-/** Opens the medium's UDF filesystem ONCE and answers both questions from
+#define UDF_VIDEO_ZONE_IFO   "/VIDEO_TS/VIDEO_TS.IFO"
+#define UDF_VIDEO_ZONE_MAGIC "DVDVIDEO-VMG"
+#define UDF_AUDIO_ZONE_IFO   "/AUDIO_TS/AUDIO_TS.IFO"
+#define UDF_AUDIO_ZONE_MAGIC "DVDAUDIO-AMG"
+
+/** Opens the medium's UDF filesystem ONCE and answers every question from
  * it, filling volume_id (caller-allocated, LASER_DISC_VOLUME_ID_MAX bytes)
  * with the Logical Volume Identifier when something was recognised.
  *
- * One open for both, rather than a function per disc kind: mounting UDF
- * is the expensive part - anchor, volume descriptor sequence, file set,
- * root directory, each a transport round trip - while the two probes
- * that follow are a path lookup apiece. Splitting them would pay that
- * cost twice on every Blu-ray, since DVD is tested first.
+ * One open for all of them, rather than a function per disc kind:
+ * mounting UDF is the expensive part - anchor, volume descriptor
+ * sequence, file set, root directory, each a transport round trip -
+ * while the probes that follow are a path lookup apiece, and a read of
+ * twelve bytes only where the lookup hits.
  *
- * DVD IS TESTED FIRST, and not only because it is the commoner disc: a
- * BD-Video disc has no VIDEO_TS, and a DVD-Video disc has no BDMV, so
- * the order is a preference between two answers that cannot both be
- * true rather than a tie-break. */
-static udf_video_t detect_udf_video(int token, char *volume_id)
+ * THE ORDER IS CHOSEN SO THAT NO DISC PAYS FOR A QUESTION ITS ANSWER
+ * ALREADY SETTLED. The Video zone is tested first because it is the
+ * commonest and because it is the only test whose result changes what
+ * still has to be asked:
+ *
+ *   - Video zone found: the Audio zone must still be tested, because a
+ *     universal disc has both. Two lookups, and the audio one misses
+ *     without a read on an ordinary DVD-Video - including on the many
+ *     that carry an empty AUDIO_TS directory, since the lookup is for
+ *     the manager file inside it.
+ *   - Video zone absent: BD-Video next, because a Blu-ray has neither
+ *     DVD zone and testing the Audio zone first would put a lookup in
+ *     front of every Blu-ray for nothing. Two lookups, exactly as
+ *     before this function knew about DVD-Audio.
+ *   - Neither: the Audio zone, which is now the only DVD layout left.
+ *     Three lookups, paid by DVD-Audio discs and by discs with no
+ *     recognisable layout at all.
+ *
+ * Note what the audio test is NOT: a tie-break against video. The two
+ * zones can both be present and a universal disc genuinely is both, so
+ * the pair is combined into one answer rather than ordered - unlike
+ * BD-Video, which no DVD can also be, and which stays an alternative. */
+static udf_disc_t detect_udf_disc(int token, char *volume_id)
 {
-    udf_video_t kind = UDF_VIDEO_NONE;
+    udf_disc_t kind = UDF_DISC_NONE;
 
     struct scsi_block_input sbi = {
             .base = { .close = NULL, .read = udf_read_cb, .size = udf_size_cb },
@@ -185,25 +225,32 @@ static udf_video_t detect_udf_video(int token, char *volume_id)
 
     udfread *udf = udfread_init();
     if (udf == NULL)
-        return UDF_VIDEO_NONE;
+        return UDF_DISC_NONE;
 
     if (udfread_open_input(udf, &sbi.base) == 0)
     {
-        if (udf_is_dvd_video(udf))
+        if (udf_zone_present(udf, UDF_VIDEO_ZONE_IFO, UDF_VIDEO_ZONE_MAGIC))
         {
-            kind = UDF_VIDEO_DVD;
+            kind = udf_zone_present(udf, UDF_AUDIO_ZONE_IFO,
+                                    UDF_AUDIO_ZONE_MAGIC)
+                 ? UDF_DISC_DVD_UNIVERSAL : UDF_DISC_DVD_VIDEO;
         }
         else
         {
             UDFFILE *f = udfread_file_open(udf, "/BDMV/index.bdmv");
             if (f != NULL)
             {
-                kind = UDF_VIDEO_BD;
+                kind = UDF_DISC_BD;
                 udfread_file_close(f);
+            }
+            else if (udf_zone_present(udf, UDF_AUDIO_ZONE_IFO,
+                                      UDF_AUDIO_ZONE_MAGIC))
+            {
+                kind = UDF_DISC_DVD_AUDIO;
             }
         }
 
-        if (kind != UDF_VIDEO_NONE)
+        if (kind != UDF_DISC_NONE)
         {
             const char *vol_id = udfread_get_volume_id(udf);
             if (vol_id != NULL)
@@ -415,7 +462,7 @@ static bool iso_find_child(const iso_ctx_t *ctx, uint32_t dir_lba, uint32_t dir_
 /** Does the info file at this extent open with the expected signature?
  *
  * THE DIRECTORY IS NOT THE ANSWER, exactly as /VIDEO_TS is not the answer
- * for a DVD (see udf_is_dvd_video above). A data disc can carry a folder
+ * for a DVD (see udf_zone_present above). A data disc can carry a folder
  * called VCD holding anything at all; what settles it is the first eight
  * bytes of the info file, which is what VLC's own vcd module reads to decide
  * whether it can play the disc. Agreeing with it here means this
@@ -472,8 +519,8 @@ static bool iso_volume_id_is_printable_ascii(const uint8_t *p, unsigned len)
  * kinds, filling volume_id (caller-allocated, LASER_DISC_VOLUME_ID_MAX
  * bytes) when something was recognised.
  *
- * One walk for both, for the same reason detect_udf_video() does one mount
- * for DVD and BD: the expensive part is reaching the root directory - PVD,
+ * One walk for both, for the same reason detect_udf_disc() does one mount
+ * for every UDF kind: the expensive part is reaching the root directory - PVD,
  * then the root extent - while each probe that follows is one directory
  * lookup and one sector.
  *
@@ -707,24 +754,33 @@ void laser_disc_identify(int token, laser_disc_t *out)
         return;
     }
 
-    switch (detect_udf_video(token, out->volume_id))
+    switch (detect_udf_disc(token, out->volume_id))
     {
-        case UDF_VIDEO_DVD:
+        case UDF_DISC_DVD_VIDEO:
             out->kind = LASER_DISC_DVD_VIDEO;
             break;
 
-        case UDF_VIDEO_BD:
+        case UDF_DISC_DVD_AUDIO:
+            out->kind = LASER_DISC_DVD_AUDIO;
+            break;
+
+        case UDF_DISC_DVD_UNIVERSAL:
+            out->kind = LASER_DISC_DVD_UNIVERSAL;
+            break;
+
+        case UDF_DISC_BD:
             out->kind = LASER_DISC_BD_VIDEO;
             break;
 
-        case UDF_VIDEO_NONE:
-            /* Not a UDF video disc - which is not yet the same as "not a
-             * video disc". A Video CD has no UDF at all, so it reaches
-             * here, and the ISO9660 probe below is its only chance.
+        case UDF_DISC_NONE:
+            /* No recognisable UDF layout - which is not yet the same as
+             * "not a video disc". A Video CD has no UDF at all, so it
+             * reaches here, and the ISO9660 probe below is its only
+             * chance.
              *
              * LAST, AND SKIPPED ENTIRELY ON ANYTHING THAT IS NOT A CD.
              * Every disc that gets this far has already been shown not to
-             * be an audio CD and not to carry a recognisable UDF video
+             * be an audio CD and not to carry a recognisable UDF
              * layout - but that still left a plain data DVD paying for a
              * PVD read and a root-directory walk on the way to an answer
              * this probe cannot give it. Only a CD can carry the
@@ -732,7 +788,7 @@ void laser_disc_identify(int token, laser_disc_t *out)
              * knows whether this is one, so the discs that reach the walk
              * are now Video CDs and plain data CDs and nothing else.
              *
-             * volume_id is untouched by detect_udf_video() on this path,
+             * volume_id is untouched by detect_udf_disc() on this path,
              * so detect_iso_video() writes into the empty string left by
              * the memset above and any failure leaves it empty. */
             if (toc == CD_TOC_NONE)

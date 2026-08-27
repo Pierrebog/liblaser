@@ -69,6 +69,8 @@ typedef enum {
 
     LASER_DISC_CD_AUDIO,
     LASER_DISC_DVD_VIDEO,
+    LASER_DISC_DVD_AUDIO,
+    LASER_DISC_DVD_UNIVERSAL,
     LASER_DISC_BD_VIDEO,
     LASER_DISC_VCD,
     LASER_DISC_SVCD,
@@ -79,8 +81,10 @@ typedef struct {
 
     /** Volume label, NUL-terminated, empty when there is none to recover.
      *
-     * For DVD-Video and BD-Video this is UDF's Logical Volume Identifier,
-     * as UTF-8. For a Video CD or Super Video CD it is ISO9660's Volume
+     * For every DVD kind and for BD-Video this is UDF's Logical Volume
+     * Identifier, as UTF-8 - one filesystem carries a universal disc's two
+     * zones, so a hybrid has one label and not one per zone. For a Video
+     * CD or Super Video CD it is ISO9660's Volume
      * Identifier, trimmed of the trailing spaces that field is padded with
      * - and frequently generic, a great many VCDs being labelled simply
      * VIDEOCD. That is the disc's own label rather than a failure to find a
@@ -125,9 +129,11 @@ typedef struct {
  *
  *   1. audio CD, by READ TOC - one command, and the only test here that
  *      cannot be confused with a data or video disc;
- *   2. a single open of the medium's UDF filesystem, which answers for both
- *      UDF video kinds: DVD-Video by /VIDEO_TS/VIDEO_TS.IFO and its
- *      "DVDVIDEO-VMG" magic, BD-Video by /BDMV/index.bdmv;
+ *   2. a single open of the medium's UDF filesystem, which answers for
+ *      every UDF kind: the Video zone by /VIDEO_TS/VIDEO_TS.IFO and its
+ *      "DVDVIDEO-VMG" magic, the Audio zone by /AUDIO_TS/AUDIO_TS.IFO and
+ *      its "DVDAUDIO-AMG" magic, BD-Video by /BDMV/index.bdmv. A disc with
+ *      both DVD zones is LASER_DISC_DVD_UNIVERSAL;
  *   3. a minimal ISO9660 walk, which answers for both Video CD kinds: VCD
  *      by /VCD/INFO.VCD and its "VIDEO_CD" magic, SVCD by /SVCD/INFO.SVD
  *      and "SUPERVCD". Run only on a medium step 1 established IS a CD,
@@ -137,6 +143,11 @@ typedef struct {
  * THE RULE IS THE FILESYSTEM THE READER WILL USE, and applying it is what
  * makes steps 2 and 3 use different ones rather than one being a fallback
  * for the other.
+ *
+ * The Audio zone rides the same rule and needs no exception: libdvdread
+ * locates AUDIO_TS.IFO through UDF exactly as it locates VIDEO_TS.IFO, so
+ * the filesystem this step reads is again the filesystem the reader will
+ * read. What differs is only which file names the zone.
  *
  * DVD-Video discs are UDF Bridge - a UDF 1.02 filesystem and an ISO9660 one
  * over the same file data - so for them either could answer. UDF is the
