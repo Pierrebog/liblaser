@@ -108,6 +108,7 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
         }
 
         unsigned char ep_in = 0, ep_out = 0;
+        uint16_t ep_in_mps = 0, ep_out_mps = 0;
 
         for (int j = 0; j < iface->bNumEndpoints; j++) {
             const struct libusb_endpoint_descriptor *ep = &iface->endpoint[j];
@@ -118,8 +119,14 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
 
             if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) && !ep_in) {
                 ep_in = ep->bEndpointAddress;
+                /* Bits 10:0 only - bits 12:11 are the additional-transactions
+                 * field on high-speed periodic endpoints, and although they
+                 * are reserved-zero for bulk, masking costs nothing and keeps
+                 * the comparison below honest. */
+                ep_in_mps = ep->wMaxPacketSize & 0x07ff;
             } else if (!(ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) && !ep_out) {
                 ep_out = ep->bEndpointAddress;
+                ep_out_mps = ep->wMaxPacketSize & 0x07ff;
             }
         }
 
@@ -135,6 +142,41 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
         entry->iface_num = iface->bInterfaceNumber;
         entry->ep_in = ep_in;
         entry->ep_out = ep_out;
+        entry->ep_max_packet = ep_in_mps < ep_out_mps ? ep_in_mps : ep_out_mps;
+
+        /* THE ENUMERATED LINK SPEED, read off the endpoint rather than asked
+         * for - because libusb_get_device_speed() answers from sysfs and an
+         * older kernel simply does not fill it in, reporting
+         * LIBUSB_SPEED_UNKNOWN for a link that is working perfectly well.
+         * wMaxPacketSize on a bulk endpoint has no such gap: the value is
+         * fixed by the speed the device enumerated at, so it says what
+         * actually happened.
+         *
+         *    64 -> full speed. USB 1.1 signalling, 12Mbit/s raw, roughly
+         *          1MB/s of usable bulk throughput once protocol overhead is
+         *          paid. A DVD-Video peaks at about 1.26MB/s and a Blu-ray
+         *          feature runs 3-5MB/s, so this is a link on which DVD is
+         *          marginal and Blu-ray is arithmetically impossible.
+         *   512 -> high speed, USB 2.0. Ample for either.
+         *  1024 -> SuperSpeed.
+         *
+         * WORTH COMPARING ACROSS REGISTRATIONS, not just reading once. A
+         * USB 3 bridge on a USB 2.0 port normally trains down to high speed;
+         * marginal cabling or a sagging supply can drop it further, to full
+         * speed, and that fallback is negotiated per enumeration rather than
+         * fixed by the hardware. A number that changes between plug-ins - or
+         * between a run that played smoothly and one that did not - is a
+         * link problem and not a transport one, and nothing in this library
+         * can raise the ceiling it sets. */
+        const uint16_t mps = entry->ep_max_packet;
+        LOGI("usb %04x:%04x: interface %u bulk endpoints, wMaxPacketSize "
+             "in=%u out=%u -> %s",
+             entry->vid, entry->pid, iface->bInterfaceNumber,
+             ep_in_mps, ep_out_mps,
+             mps <= 64    ? "FULL speed (USB 1.1) - too slow for Blu-ray, "
+                            "marginal for DVD"
+             : mps <= 512 ? "high speed (USB 2.0)"
+                          : "SuperSpeed (USB 3)");
 
         if (iface->bInterfaceSubClass != USB_MS_SUBCLASS_SCSI &&
             iface->bInterfaceSubClass != USB_MS_SUBCLASS_MMC) {

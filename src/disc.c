@@ -140,7 +140,7 @@ typedef enum {
     UDF_DISC_NONE = 0,    /* no UDF, or UDF with no known layout on it */
     UDF_DISC_DVD_VIDEO,   /* a Video zone and no Audio zone */
     UDF_DISC_DVD_AUDIO,   /* an Audio zone and no Video zone */
-    UDF_DISC_DVD_UNIVERSAL,  /* both zones */
+    UDF_DISC_DVD_UNIVERSAL,  /* both zones - a universal disc */
     UDF_DISC_BD,
 } udf_disc_t;
 

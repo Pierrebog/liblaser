@@ -618,6 +618,27 @@ typedef enum {
      * take the 2324 user-data bytes from offset 24 itself, which is what
      * VLC's cdrom.c does for every platform rather than per backend. */
     LASER_CD_SECTOR_MODE2_FORM2,
+
+    /** Whatever the sector turns out to be: MMC's Expected Sector Type 000b,
+     * "all types". The drive reads what is there instead of checking it
+     * against a declaration first.
+     *
+     * FOR A TRACK THAT IS NOT ALL ONE FORM, which is the ordinary shape of a
+     * Video CD. Its single data track carries an ISO 9660 filesystem in Mode
+     * 2 FORM 1 and the MPEG payload in FORM 2, so no one declaration is right
+     * for the whole of it: asking for Form 2 reads the payload and is refused
+     * on the filesystem area with ILLEGAL MODE FOR THIS TRACK (05h/64h),
+     * which is what a strict bridge answers for sector 151, the Video CD
+     * entry-points sector.
+     *
+     * STILL 2352 BYTES PER SECTOR, like the two above, and for a reason worth
+     * knowing: the request includes EDC/ECC precisely so that it is. A raw
+     * Form 1 sector is 12 + 4 + 8 + 2048 + 280, and a Form 2 one is
+     * 12 + 4 + 8 + 2324 + 4 - both exactly 2352. Asking for "whichever form
+     * is there" therefore costs the caller no ambiguity about the stride,
+     * and it strides its buffer and takes its payload from offset 24 exactly
+     * as for the declared kinds. */
+    LASER_CD_SECTOR_ANY,
 } laser_cd_sector_t;
 
 /**
@@ -633,6 +654,10 @@ typedef enum {
  * it is addressing, that has the information - but it means @p sector_type
  * is part of the request and not a hint. Passing the wrong one does not
  * degrade, it returns LASER_ERR_IO.
+ *
+ * LASER_CD_SECTOR_ANY OPTS OUT OF THAT CHECK, for the caller that genuinely
+ * cannot make the declaration because one track holds more than one form.
+ * See its comment above.
  *
  * A value outside laser_cd_sector_t is rejected with LASER_ERR_INVALID and an
  * error-level log, before the token is looked up, on the same grounds as

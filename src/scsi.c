@@ -69,6 +69,13 @@
  * authentication. DATA PROTECT is the same answer for a different
  * reason. Neither becomes true by waiting. */
 #define SCSI_SENSE_KEY_ILLEGAL_REQUEST  0x05
+
+/* Under ILLEGAL REQUEST, the two that say WHY a command was refused rather
+ * than merely that it was. Read after a failed START STOP UNIT, where they
+ * separate "this bridge has no such opcode" from "it has it, but not in the
+ * shape I sent" - two conclusions with opposite next steps. */
+#define SCSI_ASC_INVALID_OPCODE         0x20
+#define SCSI_ASC_INVALID_CDB_FIELD      0x24
 #define SCSI_SENSE_KEY_DATA_PROTECT     0x07
 /* 6Fh COPY PROTECTION KEY EXCHANGE FAILURE and neighbours - six distinct
  * conditions under one ASC, with three genuinely different remedies. They
@@ -100,6 +107,21 @@
 #define SCSI_ASCQ_CP_REGION_PERMANENT   0x05
 
 #define SCSI_ASC_MEDIUM_NOT_PRESENT     0x3a
+/* The qualifiers under 3Ah, which do NOT all mean the same thing and must not
+ * be handled as though they did.
+ *
+ * 3Ah/02h says the tray is OPEN. That is a physical fact the drive can see,
+ * no command changes it, and no amount of waiting will close it - the one
+ * qualifier here that is safe to treat as final.
+ *
+ * 3Ah/00h and 3Ah/01h say only that the drive has no medium state. That is
+ * what an idle, parked drive answers about a disc sitting in its own tray,
+ * and it is what this bridge answers throughout registration - so reading
+ * either as "there is no disc" rejects a perfectly good one. */
+#define SCSI_ASCQ_MEDIUM_NOT_PRESENT      0x00
+#define SCSI_ASCQ_TRAY_CLOSED             0x01
+#define SCSI_ASCQ_TRAY_OPEN               0x02
+
 #define SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED 0x28
 /* 28h/00h NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED - the only
  * qualifier under ASC 28h that actually means the disc was swapped. */
@@ -151,6 +173,23 @@
  * one at something a user experiences as a pause rather than a freeze. */
 #define LASER_SPINUP_MAX_WALL_MS   15000
 
+/* A SECOND, SHORTER wall-clock ceiling, used only while the drive is
+ * answering MEDIUM NOT PRESENT with a tray-closed or generic qualifier.
+ *
+ * The 15s above is what a promise is worth. 02h/04h/01h - becoming ready -
+ * is the drive saying it is working on it, and waiting is exactly the right
+ * response to that. 3Ah/00h and 3Ah/01h promise nothing: they are the answer
+ * of a drive that has no medium state, which is equally what an empty tray
+ * and a parked drive with a disc in it produce. Spending the full budget on
+ * that would make every browse with an empty drive block the registry lock
+ * for fifteen seconds.
+ *
+ * So this path gets its own budget, starting when START STOP UNIT has been
+ * sent (see spin_up_locked): long enough for a drive that was told to load
+ * to get its medium detected, short enough that an empty tray costs a pause
+ * rather than a freeze. Whichever ceiling is reached first ends the wait. */
+#define LASER_NO_MEDIUM_MAX_WALL_MS 4000
+
 /* LASER_MAX_BYTES_PER_TRANSFER and LASER_MIN_BYTES_PER_TRANSFER are in
  * laser_internal.h: they bound laser_entry_t::max_transfer_bytes, which
  * registry.c initialises, so they belong with that field.
@@ -169,10 +208,25 @@
 /* SCSI INQUIRY (SPC), byte 0 low 5 bits: peripheral device type. */
 #define SCSI_PDT_DIRECT_ACCESS  0x00
 
-/* INQUIRY attempts before concluding the device will not answer it. Small:
- * the command is mandatory and needs no medium, so a device that has not
- * served it by now is not going to. */
-#define LASER_INQUIRY_MAX_ATTEMPTS 3
+/* INQUIRY attempts before concluding the device will not answer it, and the
+ * first of the delays between them.
+ *
+ * On a build whose kernel mounts optical media, plugging a drive in starts
+ * usb-storage enumerating and mounting the disc. Classify during that window
+ * and the interface is taken mid-command - the bridge says so in as many
+ * words, "device still mid-transfer" - and the outstanding work belongs to a
+ * driver that has just been detached and will never collect it. The device
+ * needs time, not another command. Observed: three attempts spanning ~2.4s
+ * all failed, while a later registration got its answer on attempt 3.
+ *
+ * So: more attempts, and a delay that doubles - 100, 200, 400, 800, 1600,
+ * 3200ms - giving about six seconds of settling across seven attempts. A
+ * healthy device answers on the first and sleeps for none of it, which is why
+ * the ceiling can be this generous without costing the common case anything.
+ *
+ * The delay is around the RETRY, not before the first attempt. */
+#define LASER_INQUIRY_MAX_ATTEMPTS 7
+#define LASER_INQUIRY_RETRY_MS     100
 #define SCSI_PDT_MASK           0x1f
 #define SCSI_PDT_CD_DVD         0x05
 
@@ -217,50 +271,241 @@ static long monotonic_ms_since(const struct timespec *start)
            + (now.tv_nsec - start->tv_nsec) / 1000000L;
 }
 
-/* Wake the drive and wait for its medium to become ready before any read
- * is attempted.
+/* Only transfers at least this large are sampled. Smaller ones are dominated
+ * by command latency rather than by the link, and a run of them would drag the
+ * average down on a perfectly healthy drive. 32 KiB is comfortably above the
+ * command-overhead regime and well below the negotiated chunk size, so an
+ * ordinary read qualifies and a TEST UNIT READY never does. */
+#define LASER_XFER_SAMPLE_MIN_BYTES  (32 * 1024)
+
+/* How much has to be seen before the average is worth believing. One slow
+ * transfer proves nothing: a seek, a spin-up, a retried stall. A whole
+ * mebibyte of sustained reading is a measurement. */
+#define LASER_XFER_SAMPLE_BYTES      (1024 * 1024)
+
+/* Sampled transfers are also counted, so the report can give the SIZE AND
+ * DURATION OF ONE, not only an aggregate rate. "256 KiB in 16 ms" invites a
+ * direct comparison against a drive known to be healthy; "15961 KiB/s" has to
+ * be converted in the reader's head first. Both are printed, since the rate
+ * is what the threshold is expressed in. */
+
+/* The floor, in KiB/s, below which a link of the given wMaxPacketSize is not
+ * performing as its speed implies.
  *
- * This is the single most important thing the POC did that the module
- * initially did not: an optical drive that has spun its disc down (or
- * never spun it up since the disc was inserted) answers the very first
- * data-bearing command with NOT READY / becoming-ready, and - depending
- * on firmware - a READ that arrives cold may fail outright rather than
- * kick off the spin-up. A TEST UNIT READY is the command whose whole
- * purpose is to prod the unit and report its state; issuing it in a loop
- * both starts the mechanical spin-up and waits for it to finish.
+ * Set FAR below what the link can do, not near it: this is meant to catch a
+ * drive running at a small fraction of its capability, and must never fire on
+ * one that is merely unhurried. A high-speed link measured on healthy hardware
+ * sustains around 15,000 KiB/s; the underpowered case that motivated this
+ * managed 90. A floor of 1,000 leaves an order of magnitude of headroom in
+ * both directions.
  *
- * Mechanical spin-up of a cold DVD can take well over the transport's
- * ordinary per-command retry budget - several seconds, sometimes more
- * than ten - so this has its own, longer budget, separate from
- * LASER_MAX_RETRIES. That budget has two independent ceilings, and
- * whichever is reached first ends the wait:
+ * Full speed gets its own, lower floor because ~1,000 KiB/s is roughly its
+ * theoretical ceiling - applying the high-speed number there would fire on
+ * every full-speed link, which is slow by nature rather than by fault. */
+static uint32_t slow_floor_kib_per_s(uint16_t max_packet)
+{
+    return max_packet <= 64 ? 250 : 1000;
+}
+
+/* Accumulates transfer throughput and says something, once, if it is far
+ * below what the link should give.
  *
- *   - LASER_SPINUP_MAX_ATTEMPTS, which bounds how many times a
- *     drive that keeps answering "not yet" is asked again;
- *   - LASER_SPINUP_MAX_WALL_MS, which bounds the real time spent,
- *     and is what stops a drive that has stopped answering from turning
- *     the attempt budget into minutes of USB timeouts (see that
- *     constant's own comment - this function runs with the registry
- *     lock held, so those minutes block teardown too).
+ * THE FAILURE THIS EXISTS FOR LEAVES NO OTHER TRACE. A drive with too little
+ * power enumerates, negotiates full speed, answers every command correctly
+ * and reads at a fraction of the rate. There is no error to log because
+ * nothing fails - it is all simply slow, and the only visible symptom is a
+ * video output complaining that pictures arrive late, which points at
+ * everything except the cause. Diagnosing it once took an external
+ * measurement and several wrong theories; this is that measurement, kept.
  *
- * Two conditions end it earlier still, because neither can be improved
- * on by waiting: MEDIUM NOT PRESENT, there being no disc; and the device
- * having left the bus altogether, which TEST UNIT READY now reports
- * distinctly rather than as one more "not ready".
+ * Latched: said once per registration, whether the verdict is good or bad.
+ * A drive that is genuinely slow should not fill the log, and the healthy
+ * reading is worth having in a bug report too. After the latch this costs one
+ * comparison per transfer.
  *
- * Best-effort: a drive that never reports ready still falls through to
- * the caller, which will find out soon enough when its first real read
- * fails. Runs on LUN 0 (entry->lun before discovery); that is enough to
- * spin the mechanism up, and LUN discovery's own INQUIRY follows. */
+ * Caller MUST already hold entry->io_lock. */
+static void sample_throughput_locked(laser_entry_t *entry, int data_len,
+                                     const struct timespec *started)
+{
+    if (entry->slow_warned || data_len < LASER_XFER_SAMPLE_MIN_BYTES) {
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    const int64_t us = (int64_t)(now.tv_sec - started->tv_sec) * 1000000
+                     + (now.tv_nsec - started->tv_nsec) / 1000;
+
+    entry->xfer_bytes += (uint64_t)data_len;
+    entry->xfer_us    += (uint64_t)(us > 0 ? us : 0);
+    entry->xfer_count++;
+
+    if (entry->xfer_bytes < LASER_XFER_SAMPLE_BYTES || entry->xfer_us == 0) {
+        return;
+    }
+
+    const uint64_t kib_per_s = (entry->xfer_bytes * 1000000)
+                             / (entry->xfer_us * 1024);
+    const uint32_t floor_kib = slow_floor_kib_per_s(entry->ep_max_packet);
+
+    /* Per transfer, which is the shape a reader can compare by eye. */
+    const uint64_t per_kib = entry->xfer_bytes / entry->xfer_count / 1024;
+    const uint64_t per_ms  = entry->xfer_us / entry->xfer_count / 1000;
+
+    entry->slow_warned = 1;
+
+    if (kib_per_s >= floor_kib) {
+        LOGI("token=%d: sustained read throughput %llu KiB/s "
+             "(%llu KiB in %llu ms per transfer, wMaxPacketSize %u)",
+             entry->token, (unsigned long long)kib_per_s,
+             (unsigned long long)per_kib, (unsigned long long)per_ms,
+             entry->ep_max_packet);
+        return;
+    }
+
+    LOGW("token=%d, usb %04x:%04x: sustained read throughput is only "
+         "%llu KiB/s - %llu KiB takes %llu ms per transfer, on a link whose "
+         "wMaxPacketSize of %u implies far more. NO COMMAND HAS FAILED: the "
+         "drive answers everything correctly, just slowly, and the retries "
+         "costing that time happen in the host controller and the drive's own "
+         "firmware, below anything this library can observe. THE USUAL CAUSE "
+         "IS INSUFFICIENT POWER: an underfed drive enumerates and answers "
+         "correctly while reading at a fraction of its rate. Try a powered "
+         "hub or a stronger supply. A DVD may survive this; a Blu-ray will "
+         "stutter.",
+         entry->token, entry->vid, entry->pid,
+         (unsigned long long)kib_per_s, (unsigned long long)per_kib,
+         (unsigned long long)per_ms, entry->ep_max_packet);
+}
+
+/* One START STOP UNIT, in the exact shape asked for, reporting the drive's
+ * sense when it refuses.
+ *
+ * Split out from spin_up_locked() below because the interesting behaviour is
+ * entirely in WHICH shapes a given bridge accepts, and that is only legible
+ * if each attempt is one call with one answer. Returns the CSW status, and
+ * fills the sense triple when that status is FAIL. */
+static int start_stop_unit_locked(laser_entry_t *entry,
+                                  uint8_t immed, uint8_t byte4,
+                                  uint8_t *sense_key, uint8_t *asc,
+                                  uint8_t *ascq)
+{
+    uint8_t cdb[6] = { 0 };
+    cdb[0] = 0x1b;  /* START STOP UNIT */
+    cdb[1] = immed; /* bit 0 IMMED */
+    cdb[4] = byte4; /* bit 0 START, bit 1 LOEJ */
+
+    int csw_status = -1;
+    int rc = laser_bot_send_locked(entry, cdb, sizeof(cdb),
+                                   NULL, 0, 0, NULL, &csw_status);
+
+    *sense_key = 0xff;
+    *asc = 0;
+    *ascq = 0;
+
+    if (rc != 0 && csw_status == USB_BOT_STATUS_FAIL) {
+        /* THE POINT OF THIS HELPER. A refusal logged as a bare status says
+         * only that the drive said no; the sense says whether the opcode is
+         * missing, the shape is wrong, or the drive is declining for a
+         * reason that has nothing to do with the CDB - and those need three
+         * different responses. Not asking was the gap in the first version
+         * of this code. */
+        request_sense_locked(entry, sense_key, asc, ascq);
+    }
+
+    LOGI("token=%d: START STOP UNIT immed=%u byte4=0x%02x -> rc=%d csw=%d "
+         "sense %02x/%02x/%02x",
+         entry->token, immed, byte4, rc, csw_status,
+         *sense_key, *asc, *ascq);
+
+    return csw_status;
+}
+
+/* Tell the drive to load and spin its medium, escalating through the shapes a
+ * bridge might accept.
+ *
+ * THIS IS THE COMMAND NOBODY WAS SENDING, and its absence is why a drive with
+ * a readable disc in a closed tray could answer MEDIUM NOT PRESENT forever.
+ *
+ * TEST UNIT READY does not start a mechanism. It is a status query, and the
+ * loop below is a poll, not a prod - some firmware happens to auto-start on
+ * it, and this bridge does not. On Linux that job belongs to sr_mod, which
+ * issues 1Bh when the device is opened; laser_register() detaches the kernel
+ * driver and, until now, nothing took the job over.
+ *
+ * Byte 4: bit 0 START, bit 1 LOEJ. 0x01 spins up a medium already loaded;
+ * 0x03 adds "load it first". Byte 1 bit 0 is IMMED, set on the first attempt
+ * because bot.c's phase timeouts are fixed at 3000/5000/3000ms with no
+ * per-command override and a blocking Blu-ray spin-up can outlast them - a
+ * timeout there costs a stall recovery and tells us nothing.
+ *
+ * The escalation, and why each step is where it is:
+ *
+ *   1. IMMED=1, START.        The correct request, and the cheapest.
+ *   2a. 05h/20h INVALID OPCODE -> STOP. The bridge does not implement 1Bh at
+ *       all; every further shape is the same command and will be refused the
+ *       same way. Nothing here can make this drive load, and saying so in the
+ *       log is more useful than two more refusals.
+ *   2b. 05h/24h INVALID FIELD IN CDB -> retry WITHOUT IMMED. The opcode
+ *       exists and the shape was wrong; IMMED is the field most often
+ *       unsupported on ATAPI bridges. This one can block for the whole
+ *       spin-up, which is why it is not tried first.
+ *   2c. anything else -> retry with LOEJ. A refusal that names neither the
+ *       opcode nor a field is the drive declining on its own terms, and
+ *       "load the medium" is a different request from "spin what you have".
+ *
+ * NEVER on 3Ah/02h: LOEJ closes a tray, and the caller must not reach here
+ * with the tray open. Best-effort throughout - a drive that refuses every
+ * shape is no worse off than before it was asked, and the caller carries on
+ * polling either way. Caller MUST already hold entry->io_lock. */
+static void spin_up_locked(laser_entry_t *entry)
+{
+    uint8_t sense_key, asc, ascq;
+
+    if (start_stop_unit_locked(entry, 1, 0x01,
+                               &sense_key, &asc, &ascq) == USB_BOT_STATUS_PASS) {
+        return;
+    }
+
+    if (sense_key == SCSI_SENSE_KEY_ILLEGAL_REQUEST &&
+        asc == SCSI_ASC_INVALID_OPCODE) {
+        LOGW("token=%d: drive does not implement START STOP UNIT - nothing "
+             "here can ask it to load a medium", entry->token);
+        return;
+    }
+
+    if (sense_key == SCSI_SENSE_KEY_ILLEGAL_REQUEST &&
+        asc == SCSI_ASC_INVALID_CDB_FIELD) {
+        LOGI("token=%d: START STOP UNIT refused the CDB, retrying without "
+             "IMMED (this one may block for the whole spin-up)",
+             entry->token);
+        start_stop_unit_locked(entry, 0, 0x01, &sense_key, &asc, &ascq);
+        return;
+    }
+
+    LOGI("token=%d: START STOP UNIT refused for its own reasons, retrying "
+         "with LOEJ set", entry->token);
+    start_stop_unit_locked(entry, 1, 0x03, &sense_key, &asc, &ascq);
+}
+
 /* GET EVENT STATUS NOTIFICATION (opcode 4Ah), media event class, polled.
  * Purely diagnostic: it changes nothing, it only reports what the drive
  * believes about the tray and the medium.
  *
  * TEST UNIT READY answers "not ready" without saying why, and REQUEST SENSE
  * reports MEDIUM NOT PRESENT both for an open tray and for a bridge that has
- * lost track of a disc that is physically there. 4Ah separates the two: it
- * carries a tray-open bit, a media-present bit, and the event code of the
- * last media change. Caller MUST already hold entry->io_lock. */
+ * lost track of a disc that is physically there. 4Ah carries a tray-open bit,
+ * a media-present bit, and the event code of the last media change.
+ *
+ * DO NOT TREAT ANY OF THAT AS GROUND TRUTH. It is a second reading of the
+ * same firmware's belief, not an independent one, and it has been observed
+ * reporting "tray closed, medium absent" for a disc that was physically
+ * present and readable moments later. It corroborates rather than arbitrates,
+ * which is why nothing here branches on it and it only ever reaches the log:
+ * a give-up recorded with the drive's own account of itself is worth more
+ * than one recorded with a verdict alone. The sense qualifier is what
+ * decisions are made on. Caller MUST already hold entry->io_lock. */
 static void log_media_status_locked(laser_entry_t *entry)
 {
     uint8_t cdb[10] = { 0 };
@@ -306,10 +551,61 @@ static void log_media_status_locked(laser_entry_t *entry)
          no_event, class, buf[2], buf[3], buf[4], buf[5]);
 }
 
+/* Wake the drive and wait for its medium to become ready before any read
+ * is attempted.
+ *
+ * This is the single most important thing the POC did that the module
+ * initially did not: an optical drive that has spun its disc down (or
+ * never spun it up since the disc was inserted) answers the very first
+ * data-bearing command with NOT READY / becoming-ready, and - depending
+ * on firmware - a READ that arrives cold may fail outright rather than
+ * kick off the spin-up. A TEST UNIT READY is the command whose whole
+ * purpose is to prod the unit and report its state; issuing it in a loop
+ * both starts the mechanical spin-up and waits for it to finish.
+ *
+ * Mechanical spin-up of a cold DVD can take well over the transport's
+ * ordinary per-command retry budget - several seconds, sometimes more
+ * than ten - so this has its own, longer budget, separate from
+ * LASER_MAX_RETRIES. That budget has two independent ceilings, and
+ * whichever is reached first ends the wait:
+ *
+ *   - LASER_SPINUP_MAX_ATTEMPTS, which bounds how many times a
+ *     drive that keeps answering "not yet" is asked again;
+ *   - LASER_SPINUP_MAX_WALL_MS, which bounds the real time spent,
+ *     and is what stops a drive that has stopped answering from turning
+ *     the attempt budget into minutes of USB timeouts (see that
+ *     constant's own comment - this function runs with the registry
+ *     lock held, so those minutes block teardown too).
+ *
+ * Two conditions end it earlier still, because neither can be improved
+ * on by waiting: MEDIUM NOT PRESENT WITH THE TRAY OPEN, which no command
+ * can close; and the device having left the bus altogether, which TEST
+ * UNIT READY now reports distinctly rather than as one more "not ready".
+ *
+ * The other MEDIUM NOT PRESENT qualifiers used to end it too, and that was
+ * wrong. 3Ah/00h and 3Ah/01h are what a parked drive answers about a disc
+ * in its own closed tray, so treating them as conclusive rejected valid
+ * discs - and the more so because this loop, by itself, never gave such a
+ * drive anything to change its mind about. Hence spin_up_locked(): on the
+ * first of those answers the drive is told to load, ONCE, and the poll then
+ * carries on under its own shorter ceiling (LASER_NO_MEDIUM_MAX_WALL_MS).
+ *
+ * Best-effort: a drive that never reports ready still falls through to
+ * the caller, which will find out soon enough when its first real read
+ * fails. Runs on LUN 0 (entry->lun before discovery); that is enough to
+ * spin the mechanism up, and LUN discovery's own INQUIRY follows. */
 void laser_wait_until_ready(laser_entry_t *entry)
 {
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
+
+    /* One START STOP UNIT per wait, not one per attempt: it is a request to
+     * start a mechanism, and repeating it at a drive already starting is at
+     * best noise. no_medium_since is set when it goes out, so the shorter
+     * ceiling measures time given to the drive AFTER it was asked to load,
+     * which is the only interval during which "not yet" is informative. */
+    int spun_up = 0;
+    struct timespec no_medium_since = started;
 
     pthread_mutex_lock(&entry->io_lock);
 
@@ -318,7 +614,9 @@ void laser_wait_until_ready(laser_entry_t *entry)
      * nothing can look the token up, and cancellation is set only by the
      * laser_release() that would have to take that same lock to get here.
      *
-     * What bounds it is LASER_SPINUP_MAX_WALL_MS, checked below. */
+     * What bounds it is LASER_SPINUP_MAX_WALL_MS, checked below - or, on the
+     * no-medium path, LASER_NO_MEDIUM_MAX_WALL_MS, which is stricter and so
+     * bounds that path on its own without reaching the check below. */
     for (int attempt = 1; attempt <= LASER_SPINUP_MAX_ATTEMPTS; attempt++) {
         int rc = test_unit_ready_locked(entry);
 
@@ -355,21 +653,57 @@ void laser_wait_until_ready(laser_entry_t *entry)
 
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
-            LOGW("token=%d: no disc present (attempt %d/%d), giving up wait",
-                 entry->token, attempt, LASER_SPINUP_MAX_ATTEMPTS);
-            /* Ask the drive what it thinks the tray and the medium are
-             * doing, so the give-up is recorded with a reason rather than
-             * only with a verdict. */
-            log_media_status_locked(entry);
-            pthread_mutex_unlock(&entry->io_lock);
-            return;
+            if (ascq == SCSI_ASCQ_TRAY_OPEN) {
+                /* The one qualifier worth believing. Nothing this code can
+                 * send closes a tray, so waiting is pure cost. */
+                LOGW("token=%d: tray open (attempt %d/%d), giving up wait",
+                     entry->token, attempt, LASER_SPINUP_MAX_ATTEMPTS);
+                /* Ask the drive what it thinks the tray and the medium are
+                 * doing, so the give-up is recorded with a reason rather
+                 * than only with a verdict. */
+                log_media_status_locked(entry);
+                pthread_mutex_unlock(&entry->io_lock);
+                return;
+            }
+
+            /* Tray closed, or no qualifier at all: the drive has no medium
+             * state, which an empty tray and a parked drive holding a disc
+             * produce alike. Tell it to load, once, and keep polling - the
+             * shorter ceiling below is what bounds the empty case. */
+            if (!spun_up) {
+                spun_up = 1;
+                spin_up_locked(entry);
+                clock_gettime(CLOCK_MONOTONIC, &no_medium_since);
+                continue;
+            }
+
+            long no_medium_ms = monotonic_ms_since(&no_medium_since);
+            if (no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS) {
+                LOGW("token=%d: still no medium %ldms after START STOP UNIT "
+                     "(attempt %d/%d), giving up wait",
+                     entry->token, no_medium_ms, attempt,
+                     LASER_SPINUP_MAX_ATTEMPTS);
+                log_media_status_locked(entry);
+                pthread_mutex_unlock(&entry->io_lock);
+                return;
+            }
+
+            LOGI("token=%d: no medium yet, waiting %dms (attempt %d/%d, "
+                 "%ldms of %dms since START STOP UNIT)",
+                 entry->token, LASER_SPINUP_DELAY_MS, attempt,
+                 LASER_SPINUP_MAX_ATTEMPTS, no_medium_ms,
+                 LASER_NO_MEDIUM_MAX_WALL_MS);
+            usleep(LASER_SPINUP_DELAY_MS * 1000);
+            continue;
         }
 
         /* Wall-clock check before committing to another round, so the
          * ceiling bounds the time actually spent rather than being
          * noticed one full attempt late. Placed after the sense checks so
-         * that a conclusive answer - no disc - still ends the wait on its
-         * own terms rather than as a timeout. */
+         * that a conclusive answer - an open tray - still ends the wait on
+         * its own terms rather than as a timeout, and so that the no-medium
+         * path above is measured against its own shorter ceiling instead of
+         * this one. */
         long elapsed = monotonic_ms_since(&started);
         if (elapsed >= LASER_SPINUP_MAX_WALL_MS) {
             LOGW("token=%d: spin-up wall-clock budget exhausted (%ldms over "
@@ -433,9 +767,25 @@ static int inquiry_pdt(laser_entry_t *entry, int attempts, uint8_t *pdt)
             return BOT_FAIL_NO_DEVICE;
         }
 
+        if (attempt == attempts) {
+            LOGI("token=%d: LUN %u INQUIRY unanswered (rc=%d, %d bytes, "
+                 "attempt %d/%d, giving up)",
+                 entry->token, entry->lun, rc, actual, attempt, attempts);
+            break;
+        }
+
+        /* Doubling from LASER_INQUIRY_RETRY_MS. Waiting is the whole point -
+         * see the constant's comment - so the sleep is what the retry
+         * actually consists of; the command itself has already failed as
+         * fast as it is going to. */
+        const int delay_ms = LASER_INQUIRY_RETRY_MS << (attempt - 1);
+
         LOGI("token=%d: LUN %u INQUIRY unanswered (rc=%d, %d bytes, "
-             "attempt %d/%d)",
-             entry->token, entry->lun, rc, actual, attempt, attempts);
+             "attempt %d/%d), settling %dms",
+             entry->token, entry->lun, rc, actual, attempt, attempts,
+             delay_ms);
+
+        usleep((useconds_t)delay_ms * 1000);
     }
 
     return -1;
@@ -774,9 +1124,28 @@ laser_status_t laser_scsi_cdb(int token,
         /* Local to this attempt: request_sense_locked() below issues its
          * own BOT transaction, and this value must survive it intact. */
         int csw_status = -1;
+        struct timespec xfer_started;
+        clock_gettime(CLOCK_MONOTONIC, &xfer_started);
+
         int rc = laser_bot_send_locked(entry, cdb, cdb_len, data, data_len,
                                          data_in, actual_len, &csw_status);
         if (rc == 0) {
+            /* SUCCESS AFTER A RETRY IS WORTH A LINE. Every path that gives
+             * up says so, and this one used to say nothing at all - so a
+             * command that failed twice and then worked left no trace, and a
+             * drive limping through its whole budget on every command looked
+             * identical in the log to one answering first time. That is a
+             * blind spot of exactly the shape this file's other logging
+             * exists to prevent, and it misdirects a diagnosis the same way:
+             * "no errors in the log" stops meaning "nothing went wrong".
+             *
+             * Only when attempt > 1, so the ordinary case stays silent. */
+            if (attempt > 1) {
+                LOGW("token=%d: cdb 0x%02x succeeded on attempt %d/%d - "
+                     "earlier attempts failed and were retried",
+                     token, cdb[0], attempt, LASER_MAX_RETRIES);
+            }
+            sample_throughput_locked(entry, data_len, &xfer_started);
             result = LASER_OK;
             break;
         }
@@ -839,10 +1208,27 @@ laser_status_t laser_scsi_cdb(int token,
         }
 
         /* Disc gone or swapped: never retry, surface immediately so an
-         * ejection doesn't feel sluggish to the user. */
+         * ejection doesn't feel sluggish to the user.
+         *
+         * ALL qualifiers of 3Ah, deliberately - unlike
+         * laser_wait_until_ready(), which now splits them.
+         *
+         * The distinction that matters there is worthless here, and briefly
+         * making this branch match it was a mistake worth recording. That
+         * loop is trying to bring a drive up and can act on the difference:
+         * it sends START STOP UNIT and gives the drive a bounded window to
+         * change its mind. This path has already been through that window.
+         * By the time an ordinary command sees 3Ah, the wait has either
+         * succeeded - in which case a fresh 3Ah means the disc really did
+         * leave - or given up, in which case retrying six times per command
+         * only makes the same failure slower. Measured: a browse that failed
+         * in 155ms took tens of seconds and still failed.
+         *
+         * Fail fast, and let the wait be the only place that waits. */
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
-            LOGW("token=%d: no disc present, not retrying", token);
+            LOGW("token=%d: no disc present (%02x/%02x/%02x), not retrying",
+                 token, sense_key, asc, ascq);
             result = LASER_ERR_MEDIA_GONE;
             break;
         }
@@ -1356,8 +1742,19 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
              * it terminate. */
             int short_total = blocks_done + actual_len / block_size;
             if (short_total == 0) {
-                LOGW("token=%d: read of %d %s at LBA %u returned no data",
-                     token, num_blocks, what, lba);
+                /* Both lengths named, because the interesting failure is the
+                 * one where they are close. A whole sector short of the
+                 * request is a scratch; a couple of hundred bytes short is a
+                 * drive returning a SMALLER SECTOR than the one asked for -
+                 * 2072 rather than 2352, a raw Mode 2 Form 1 sector, which
+                 * LASER_CD_SECTOR_ANY can legitimately encounter and which
+                 * this strict check then rejects as unreadable. Nothing
+                 * observed does this, and the numbers in this line are what
+                 * would say so at a glance if something did. */
+                LOGW("token=%d: read of %d %s at LBA %u returned no usable "
+                     "data (%d of %d bytes)",
+                     token, num_blocks, what, lba, actual_len,
+                     chunk * block_size);
                 return (int)LASER_ERR_IO;
             }
             return short_total;
@@ -1447,25 +1844,41 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
      *     try is sector type "any" (byte 1 = 0x00) with User Data alone
      *     (byte 9 = 0x10) - not the return of the EDC/ECC bits.
      *
-     *   MODE2_FORM2: Expected Sector Type = Mode 2 Form 2 (101b), with Sync,
-     *     both Header Codes and User Data requested (0xF0).
+     *   MODE2_FORM2 and ANY: Sync, both Header Codes, User Data AND EDC/ECC
+     *     (0xF8). They differ only in Expected Sector Type - Mode 2 Form 2
+     *     (101b) where the caller can declare the form, "all types" (000b)
+     *     where it cannot.
      *
      *     THE AUDIO REASONING DOES NOT TRANSFER, and that is why the flags
      *     differ rather than being shared: a Mode 2 Form 2 sector really
-     *     does carry a sync pattern, a header and a sub-header, so asking
-     *     for them is asking for structures that exist. What is NOT
-     *     requested here is EDC/ECC, and the four bytes it would return are
-     *     the ones cdrom.c discards anyway - it takes 2324 bytes from offset
-     *     24 and stops.
+     *     does carry a sync pattern, a header, a sub-header and an EDC, so
+     *     asking for them is asking for structures that exist.
      *
-     *     0xF0 rather than 0xF8 because it is what VLC's own BSD arm has
-     *     shipped for this sector kind for years, against the same drives.
-     *     THE ONE THING TO VERIFY ON REAL HARDWARE: whether the drive counts
-     *     those trailing four bytes into its transfer length regardless. A
-     *     drive that returns 2348 rather than 2352 per sector will trip the
-     *     strict length check below and be reported as a short read, one
-     *     sector at a time. The fix if that is ever observed is 0xF8, which
-     *     asks for the EDC explicitly and makes 2352 unambiguous. */
+     *     0xF8 RATHER THAN 0xF0, AND THE FOUR BYTES MATTER EVEN THOUGH NO
+     *     CALLER READS THEM. This was 0xF0 - what VLC's own BSD arm has
+     *     shipped for years - with a note that the thing to verify on real
+     *     hardware was whether a drive counts the trailing EDC into its
+     *     transfer length regardless. Two did not:
+     *
+     *         0xF0, Mode 2 Form 1:  12 + 4 + 8 + 2048        = 2072
+     *         0xF0, Mode 2 Form 2:  12 + 4 + 8 + 2324        = 2348
+     *         0xF8, Mode 2 Form 1:  12 + 4 + 8 + 2048 + 280  = 2352
+     *         0xF8, Mode 2 Form 2:  12 + 4 + 8 + 2324 + 4    = 2352
+     *
+     *     Under 0xF0 neither form is 2352, so the block_size above was a
+     *     fiction that only held on bridges which pad the transfer and
+     *     declare the difference as residue. On one that reports honestly a
+     *     Form 1 sector came back as "2072 of 2352 bytes" and failed the
+     *     strict length check; worse, a MULTI-SECTOR payload read packs
+     *     sectors at 2348 while every caller indexes at 2352, so sector n is
+     *     misread by 4n bytes and the MPEG stream desynchronises after the
+     *     first one. That is silent, and it is why a Video CD's entry points
+     *     could parse while no demuxer would accept the payload.
+     *
+     *     0xF8 makes BOTH forms exactly 2352, which is what block_size above
+     *     asserts, what cdrom.c strides by, and what laser_cd_sector_t
+     *     promises. The EDC bytes are discarded by every caller - they are
+     *     requested for their LENGTH, not their content. */
     uint8_t expected_type;
     uint8_t field_flags;
 
@@ -1477,7 +1890,16 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
 
         case LASER_CD_SECTOR_MODE2_FORM2:
             expected_type = 0x14;
-            field_flags   = 0xF0;
+            field_flags   = 0xF8;
+            break;
+
+        case LASER_CD_SECTOR_ANY:
+            /* Expected Sector Type 000b: read what is there, check nothing.
+             * Same field flags as above, and that is the point - 0xF8 yields
+             * 2352 bytes for Form 1 and Form 2 alike, so "whichever form is
+             * there" costs the caller no ambiguity about the stride. */
+            expected_type = 0x00;
+            field_flags   = 0xF8;
             break;
 
         default:

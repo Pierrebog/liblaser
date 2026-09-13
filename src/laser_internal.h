@@ -236,6 +236,41 @@ typedef struct {
 
     unsigned char ep_in;
     unsigned char ep_out;
+
+    /* wMaxPacketSize of the bulk pair, recorded by
+     * laser_find_bulk_endpoints() so the throughput check in scsi.c knows
+     * what the link is supposed to be capable of.
+     *
+     * Read off the descriptor rather than from libusb_get_device_speed(),
+     * which answers out of sysfs and reports LIBUSB_SPEED_UNKNOWN on kernels
+     * that do not fill it in - observed on the very devices most likely to
+     * need the check. 64 is full speed, 512 high speed, 1024 SuperSpeed. */
+    uint16_t ep_max_packet;
+
+    /* Set when laser_register() successfully detached the kernel driver, so
+     * the unwind ladder knows whether it has one to give back. Not simply
+     * "was a driver attached": only a detach WE performed may be undone, and
+     * only on a path that gives the device up. */
+    int kernel_driver_detached;
+
+    /* Sustained-throughput sampling, for the one failure mode that produces
+     * no error of any kind: a drive with too little power.
+     *
+     * Such a drive enumerates, negotiates full link speed, answers every
+     * command correctly and reads at a fraction of what the link can carry.
+     * Nothing in this library sees an error, because there is not one -
+     * every command succeeds, slowly. It was diagnosed once by measuring
+     * from outside, and cost several wrong theories on the way; these three
+     * fields exist so the next occurrence names itself.
+     *
+     * Written under io_lock in laser_scsi_cdb(), which is the only place a
+     * data transfer is timed. slow_warned latches so the warning is said
+     * once per registration and never becomes noise. */
+    uint64_t xfer_bytes;
+    uint64_t xfer_us;
+    uint64_t xfer_count;
+    int      slow_warned;
+
     uint32_t tag;
 
     /* USB identity of this device, read once at registration from the
@@ -489,12 +524,20 @@ enum {
  * descriptor and a new token.
  *
  * LASER_OPTICAL_NO_ANSWER MATTERS BEYOND "we could not tell". INQUIRY is
- * mandatory and needs no medium, so a device that will not serve it is not a
- * device that is still warming up: it is one that is not answering at all.
- * Waiting for such a device to become ready can only spend the whole spin-up
- * budget - seventeen seconds, measured on a card reader whose INQUIRY times
- * out - to conclude what this call already established. The caller skips
- * that wait on this answer, while still registering the device.
+ * mandatory and needs no medium, so a device that will not serve it - after
+ * this call has already spent its attempts and its settling delays on it - is
+ * not a device that is still warming up: it is one that is not answering at
+ * all. Waiting for such a device to become ready can only spend the whole
+ * spin-up budget - seventeen seconds, measured on a card reader whose INQUIRY
+ * times out - to conclude what this call already established.
+ *
+ * THE CALLER DECLINES ON THIS ANSWER. It used to register the device and
+ * merely skip the wait, on the grounds that silence is not proof of the wrong
+ * kind of device. That changed when the kernel driver stopped being handed
+ * back on release: registering now means holding the interface for as long as
+ * the device stays plugged in, and the kernel - the only agent that can
+ * properly reset a device wedged mid-transfer - never gets it back. Declining
+ * gives it back, which is the one thing that helps.
  *
  * Called once at registration, after the endpoints are known and the device
  * has been reset, since it needs to send real SCSI commands. Does NOT need

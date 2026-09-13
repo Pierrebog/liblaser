@@ -277,6 +277,15 @@ static void release_slot(laser_entry_t *slot)
     pthread_mutex_unlock(&g_table_lock);
 }
 
+/* libusb's speed enum is NOT the USB generation number, and reading it as one
+ * is off by a place at every value: LOW is 1, FULL 2, HIGH 3, SUPER 4. A drive
+ * negotiating USB 2.0 high speed therefore reports 3, which is easy to misread
+ * as SuperSpeed - and on a bus-powered optical drive the difference between
+ * "negotiated USB 3" and "fell back to USB 2" is worth being able to read at a
+ * glance. Hence a name rather than the number alone.
+ *
+ * The number is logged too, so a value this does not know about - a speed
+ * added to a later libusb - still says something. */
 static const char *speed_name(int speed)
 {
     switch (speed) {
@@ -287,6 +296,33 @@ static const char *speed_name(int speed)
         case LIBUSB_SPEED_SUPER:    return "super, 5Gbps";
         case LIBUSB_SPEED_SUPER_PLUS: return "super+, 10Gbps";
         default:                    return "unrecognised";
+    }
+}
+
+/* Hand the interface's kernel driver back, if we were the ones who took it.
+ *
+ * Only meaningful on a path that is giving the device up: see the call site
+ * in laser_register()'s unwind ladder for why a device we keep is never
+ * re-attached. Best-effort - the device may already be gone, which is not an
+ * error worth a warning of its own. */
+static void reattach_kernel_driver(laser_entry_t *entry)
+{
+    if (!entry->kernel_driver_detached)
+        return;
+
+    entry->kernel_driver_detached = 0;
+
+    int ret = libusb_attach_kernel_driver(entry->handle, entry->iface_num);
+    if (ret == LIBUSB_SUCCESS) {
+        LOGI("register(fd=%d, usb %04x:%04x): kernel driver re-attached on "
+             "interface %u", entry->token, entry->vid, entry->pid,
+             entry->iface_num);
+    } else if (ret != LIBUSB_ERROR_NO_DEVICE) {
+        LOGW("register(fd=%d, usb %04x:%04x): libusb_attach_kernel_driver(%u) "
+             "failed: %s - the device may stay invisible to the system until "
+             "it is unplugged",
+             entry->token, entry->vid, entry->pid, entry->iface_num,
+             libusb_error_name(ret));
     }
 }
 
@@ -436,11 +472,65 @@ static int laser_register(int fd)
         goto err_handle;
     }
 
-    libusb_set_auto_detach_kernel_driver(entry->handle, 1);
+    /* DETACHED BY HAND, AND NEVER GIVEN BACK.
+     *
+     * libusb_set_auto_detach_kernel_driver() would do the detaching in one
+     * line and was what this used to call. It also RE-ATTACHES the kernel
+     * driver when the interface is released, and that half is what could not
+     * stay.
+     *
+     * On an Android build whose kernel binds usb-storage/sr to an optical
+     * drive and mounts the disc - older devices do; the phones this was first
+     * written against do not - re-attaching on every teardown hands the drive
+     * straight back to the kernel, which re-binds, re-mounts, and starts its
+     * own conversation with it. The next registration then detaches it
+     * mid-transfer, and two initiators end up alternating on one Bulk-Only
+     * device that can only serve one. Observed as: the first classification
+     * of a session works, and every later one costs two Reset Recoveries and
+     * three INQUIRY attempts before the drive answers, with the disc walk
+     * that follows failing on a drive that has not settled - while
+     * ACTION_MEDIA_UNMOUNTED for sr0 arrives, from the kernel, in the middle
+     * of our own registration.
+     *
+     * So the interface is taken once and kept for as long as the device is
+     * plugged in. THE COST IS DELIBERATE AND WORTH NAMING: on such a device
+     * the drive stops being visible to the rest of the system - no
+     * /storage/sr0 for the file manager or anything else - until it is
+     * physically unplugged, at which point the kernel re-binds on its own.
+     * Nothing is lost on a device that never mounted it in the first place.
+     *
+     * THIS MAY NOT BE THE ONLY THING RE-BINDING THE DRIVER, and the log line
+     * below is what tells. usbfs re-probes the interfaces a process
+     * disconnected when that process closes the device fd - and every
+     * classification does close it, since the Java side opens a fresh
+     * UsbDeviceConnection per pass. If "kernel driver attached" keeps
+     * appearing on registrations after the first while a device stays
+     * plugged in, then the re-bind is coming from that fd close rather than
+     * from libusb, this change is not sufficient on its own, and the fix is
+     * to stop tearing the registration down between classifications. If it
+     * appears only once per plug-in, this was the whole of it.
+     *
+     * Not fatal on failure: if the driver cannot be detached, the claim below
+     * fails with LIBUSB_ERROR_BUSY and reports it in its own terms, and one
+     * error is better told there than guessed at here. */
     ret = libusb_kernel_driver_active(entry->handle, entry->iface_num);
-    if (ret == 1)
-        LOGI("register(fd=%d): kernel driver was attached on interface %u",
-             fd, entry->iface_num);
+    if (ret == 1) {
+        LOGI("register(fd=%d): kernel driver attached on interface %u, "
+             "detaching it and not giving it back", fd, entry->iface_num);
+        ret = libusb_detach_kernel_driver(entry->handle, entry->iface_num);
+        if (ret == LIBUSB_SUCCESS)
+            entry->kernel_driver_detached = 1;
+        else
+            LOGW("register(fd=%d, usb %04x:%04x): "
+                 "libusb_detach_kernel_driver(%u) failed: %s",
+                 fd, entry->vid, entry->pid, entry->iface_num,
+                 libusb_error_name(ret));
+    } else if (ret < 0) {
+        LOGW("register(fd=%d, usb %04x:%04x): kernel_driver_active(%u) "
+             "failed: %s (continuing, the claim below will tell)",
+             fd, entry->vid, entry->pid, entry->iface_num,
+             libusb_error_name(ret));
+    }
 
     ret = libusb_claim_interface(entry->handle, entry->iface_num);
     if (ret != LIBUSB_SUCCESS) {
@@ -496,25 +586,40 @@ static int laser_register(int fd)
         goto err_iface;
     }
 
+    /* A device that answered nothing is DECLINED, and this used to register
+     * it anyway on the reasoning that silence is not proof it is the wrong
+     * kind of device. That was defensible while the kernel driver came back
+     * on release. It stopped being so when the detach became permanent.
+     *
+     * Registering it means holding its interface for as long as it stays
+     * plugged in - a device we could not identify, cannot read, and are not
+     * going to serve a single useful command from. Worse, the kernel is the
+     * only agent that can properly reset such a device, and holding the
+     * interface is exactly what stops it: observed as a drive that stayed
+     * unusable until it was physically unplugged, no matter how many times
+     * classification was retried.
+     *
+     * Declining costs nothing a caller notices - the device failed every
+     * read either way - and buys the one thing that helps: usb-storage gets
+     * it back through the unwind ladder below, re-probes it, and the next
+     * classification starts from a device the kernel has reset rather than
+     * one we have been sitting on. */
+    if (optical == LASER_OPTICAL_NO_ANSWER) {
+        LOGW("register(fd=%d, usb %04x:%04x): INQUIRY unanswered on every "
+             "unit, declining and handing the device back to the kernel - it "
+             "is most likely still busy with work started before this claim",
+             fd, entry->vid, entry->pid);
+        ret = LIBUSB_ERROR_IO;
+        goto err_iface;
+    }
+
     /* Spin the drive up and wait for its medium before anything tries to
      * read it. A cold optical drive answers the first data command with
      * NOT READY / becoming-ready and, on some firmware, a READ that
      * arrives before spin-up fails outright rather than starting it - so
      * this must happen before any classification or playback read. See its
-     * doc comment.
-     *
-     * Skipped when INQUIRY went unanswered. Not an optimisation: waiting
-     * presumes a device that is busy becoming ready, and one that will not
-     * serve a command needing no medium is not that. It only spends the
-     * budget to learn again what the probe just found. The device is still
-     * registered - silence is not proof it is the wrong kind - so a caller
-     * may still try to read it, and will fail quickly instead of slowly. */
-    if (optical == LASER_OPTICAL_NO_ANSWER) {
-        LOGI("register(fd=%d, usb %04x:%04x): INQUIRY unanswered, skipping "
-             "the spin-up wait", fd, entry->vid, entry->pid);
-    } else {
-        laser_wait_until_ready(entry);
-    }
+     * doc comment. */
+    laser_wait_until_ready(entry);
 
     /* Publish. Everything this entry needs is now in place, so from here
      * laser_lookup() may hand it out - and not one line before, which is the
@@ -543,6 +648,23 @@ static int laser_register(int fd)
     err_iface:
     libusb_release_interface(entry->handle, entry->iface_num);
     err_handle:
+    /* GIVE THE KERNEL ITS DRIVER BACK ON EVERY PATH THAT DOES NOT KEEP THE
+     * DEVICE - and the path that matters is the ordinary one, not an error.
+     *
+     * The interface has to be claimed before INQUIRY can say what the device
+     * is, so a USB key reaches this point with usb-storage already detached
+     * and is then declined for not being an optical drive. Leaving it
+     * detached would take the user's flash drive away from the system
+     * entirely, every time the browser classifies it, for no benefit
+     * whatsoever - this library has already established it wants nothing to
+     * do with the device.
+     *
+     * A drive we DO keep is a different matter and is handled elsewhere: it
+     * is never re-attached, because handing it back between classifications
+     * lets the kernel re-bind, re-mount and start its own conversation with
+     * a drive we are about to claim again, and two initiators on one
+     * Bulk-Only device is what that costs. See the detach above. */
+    reattach_kernel_driver(entry);
     libusb_close(entry->handle);
     err_ctx:
     libusb_exit(entry->ctx);
