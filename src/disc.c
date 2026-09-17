@@ -740,6 +740,15 @@ void laser_disc_identify(int token, laser_disc_t *out)
      * makes that true without a return value to check. */
     memset(out, 0, sizeof(*out));
 
+    /* A drive that spent its whole readiness budget answering "not yet" will
+     * answer every probe below the same way, each one paying a full retry
+     * budget to find that out. The wait has already been patient on this
+     * drive's behalf; repeating it three times over only delays the same
+     * verdict. */
+    if (laser_token_not_ready(token)) {
+        return;
+    }
+
     /* One READ TOC, answering two questions: is this an audio CD, and - if
      * not - is it a CD at all, and where does its filesystem start. Both
      * later steps depend on the answer, which is why it goes first. */

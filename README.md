@@ -11,8 +11,7 @@ Android grants userspace access to a USB device as a file descriptor obtained
 through `UsbManager`. There is no block device, no mount point, and no
 `/dev/sr0`: everything VLC's optical stack normally relies on is absent. The
 work is therefore to give that stack a path to a drive it can only reach by
-sending SCSI (see `table of acronyms` at §9) command blocks over USB bulk 
-endpoints itself.
+sending SCSI command blocks over USB bulk endpoints itself.
 
 ## 2. User's manual
 
@@ -45,7 +44,7 @@ get two tiles with the same name: the one with a **music** icon plays the
 audio side, the one with a **film** icon plays the video side.
 
 **Blu-rays** appear as one tile. An unencrypted volume plays as-is. A
-commercial one needs AACS. To enable it, you need to:
+commercial one needs [AACS](#7-acronyms). To enable it, you need to:
 - Install `libaacs-provider.apk`, a separate application holding nothing but
   `libaacs.so.0`;
 - Place `KEYDB.cfg` at `/sdcard/aacs/KEYDB.cfg` and grant VLC *All files
@@ -79,13 +78,15 @@ Four decisions shape everything else.
 
 **The fd is the token.** The descriptor Kotlin obtains from
 `UsbDeviceConnection.getFileDescriptor()` is carried, as a decimal number
-inside an MRL, all the way down to the transport, where it identifies the
+inside an [MRL](#7-acronyms), all the way down to the transport, where it identifies the
 device in a small registry. No parallel handle type, no registration call from
-the Java side, no lifecycle to keep in sync. The cost is that the token is
+the Java side, no lifecycle to keep in sync. It stays an ordinary argument the
+whole way down: each library between the MRL and the transport takes it as the
+target of its open call, so nothing carries it out of band. The cost is that the token is
 meaningful only within one process and one connection, which makes an
 laser MRL a *session-scoped* name: it may never enter a persistent store,
 and the connection behind it needs an owner that outlives the screen that
-opened it. Both are handled — see §6.
+opened it. Both are handled.
 
 **One shared contrib, not per-module code.** `liblaser` owns the
 device registry (`registry.c`), the USB interface and endpoint discovery
@@ -94,9 +95,9 @@ layer (`scsi.c`) and the identification of the disc in the drive (`disc.c`) —
 one file per concern, since the three transport ones started life as a single
 one and the split follows the boundaries its own header comment already named.
 The VLC access module, libdvdcss, libdvdread/libdvdnav and the CD-Audio module
-all reach the drive through it. Retry policy, LUN selection, sense-code
+all reach the drive through it. Retry policy, [LUN](#7-acronyms) selection, sense-code
 interpretation and error semantics exist once. libbluray is the one consumer
-that needs none of it: it reads through the access module's stream (§6).
+that needs none of it: it reads through the access module's stream.
 
 **Standards as the specification, hardware as the test.** Where a device could
 differ, the code follows what the specification prescribes and degrades
@@ -114,11 +115,11 @@ and built by the existing contrib and autotools machinery. Nothing
 short-circuits libVLC to reach the Java side: **this project adds no new JNI
 call at all.** The constraint is load-bearing — the fd travels inside an MRL
 because an MRL is a string libVLC already carries end to end, and the
-connection's lifetime is reconciled from events libVLC already emits (§6). It
+connection's lifetime is reconciled from events libVLC already emits. It
 also decides what does *not* get written: where a behaviour was missing it was
 added in the shape VLC already uses, in the module that owns it, rather than
 routed around from outside — hence the small, local patches to `cdda.c`,
-`dvdread.c` and libdvdcss.
+`dvdread.c`, libdvdcss, libdvdread and libdvdnav.
 
 ## 4. Architecture
 
@@ -158,10 +159,10 @@ which of the three paths above is taken:
 
 | MRL                                                                                      | Purpose                                                                                                                                                                                                                                                                                                  |
 |------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `file://laser/<fd>`                                                                      | Classification. The `file` scheme is borrowed because the preparser types items from a fixed scheme table and never opens a module for a scheme it does not know (§6).                                                                                                                                   |
-| `laser/dvd://<fd>`, `laser/dvdsimple://<fd>`, `laser/dvda://<fd>`, `laser/bluray://<fd>` | Video and DVD-Audio playback. libVLC reads this as access `laser` plus a demuxer name. A DVD-Video is offered under two of them — with menus and without — and a universal disc under `dvda` and `dvd`, one per zone, told apart by their icon alone (§6).                                               |
-| `cdda://laser/<fd>`                                                                      | CD-Audio. Here the drive is the URI's *authority*, not the access module: `cdda` is an access_demux and reaches the contrib itself. It expands into one MRL per track, `…/Track%20NN` (§6).                                                                                                              |
-| `vcd://laser/<fd>`, `svcd://laser/<fd>`                                                  | Video CD and Super Video CD. Same shape and same reason as the line above — the drive is the authority, and `vcd` reaches the contrib through the same `cdrom.c` as `cdda`. A Video CD is a *video* disc that stays on the *CD* path, because what decides the path is the sector, not the content (§6). |
+| `file://laser/<fd>`                                                                      | Classification. The `file` scheme is borrowed because the preparser types items from a fixed scheme table and never opens a module for a scheme it does not know.                                                                                                                                   |
+| `laser/dvd://<fd>`, `laser/dvdsimple://<fd>`, `laser/dvda://<fd>`, `laser/bluray://<fd>` | Video and DVD-Audio playback. libVLC reads this as access `laser` plus a demuxer name. A DVD-Video is offered under two of them — with menus and without — and a universal disc under `dvda` and `dvd`, one per zone, told apart by their icon alone.                                               |
+| `cdda://laser/<fd>`                                                                      | CD-Audio. Here the drive is the URI's *authority*, not the access module: `cdda` is an access_demux and reaches the contrib itself. It expands into one MRL per track, `…/Track%20NN`.                                                                                                              |
+| `vcd://laser/<fd>`, `svcd://laser/<fd>`                                                  | Video CD and Super Video CD. Same shape and same reason as the line above — the drive is the authority, and `vcd` reaches the contrib through the same `cdrom.c` as `cdda`. A Video CD is a *video* disc that stays on the *CD* path, because what decides the path is the sector, not the content. |
 
 Two asymmetries in the diagram are worth reading twice. The `dvd` and `bluray`
 demuxers get their **blocks** from the access module, not from the contrib —
@@ -208,8 +209,8 @@ being video, sits beside the audio CD rather than beside the DVD.
 ```
 
 **Read downwards and the vocabulary changes once per box.** `disc.c` speaks
-filesystems and knows no CDB; `scsi.c` speaks CDBs and sense keys and knows no
-CBW; `bot.c` speaks CBW, data, CSW and knows no sense code and no retry;
+filesystems and knows no [CDB](#7-acronyms); `scsi.c` speaks CDBs and sense keys and knows no
+[CBW](#7-acronyms); `bot.c` speaks CBW, data, [CSW](#7-acronyms) and knows no sense code and no retry;
 `usb.c` speaks descriptors and endpoints and never builds a command at all.
 
 **A consumer can enter the stack at three different heights**, which is why
@@ -218,7 +219,8 @@ access module enters at the top for classification and in the middle for
 playback, taking sectors straight from `scsi.c`; `cdrom.c` enters in the middle
 only, since a raw CD sector is a command and not a filesystem; libdvdcss enters
 at `registry.c` for the session bracket — `laser_acquire()` then
-`laser_css_session_begin()` in `dvdcss_open()`, unwound in both close paths —
+`laser_css_session_begin()` in `dvdcss_open_common()`, unwound in both close
+paths —
 and at `scsi.c` for its key commands, every one of which goes through the
 single `LaserSend()` wrapper in `ioctl.c`. Nothing enters at `bot.c` or below.
 
@@ -227,12 +229,12 @@ takes its blocks from the access module's stream and needs no token, as §4
 already says. libaacs has no edge either, for a different reason: its Android
 patch is `dirs_android.c` alone, which decides where `KEYDB.cfg` is read from
 and where the key cache is written — a storage-location problem that exists on
-Android whether or not a USB drive is involved, and one that touches no MMC
+Android whether or not a USB drive is involved, and one that touches no [MMC](#7-acronyms)
 code. `aacs.c` is untouched and still opens a drive by *path*, through
 `mmc_open()`, which is exactly what a `UsbDeviceConnection` fd cannot provide.
 Giving it the treatment libdvdcss got would add the same two edges as
 libdvdcss has — `registry.c` for a session bracket, `scsi.c` for the Volume ID
-and the rest of the handshake — and that is the work §7 describes, not
+and the rest of the handshake — and that is the work §5 describes, not
 something the drawing above is missing.
 
 **`registry.c` is not a layer in that stack** — it sits beside it, and every
@@ -252,190 +254,7 @@ layer even though only the transport layer ever needs it. Note what that
 arrow does *not* carry: `bot.c`'s bulk transfers go straight to libusb, so the
 only thing crossing from `bot.c` into `usb.c` is the reset.
 
-## 5. What works today
-
-**Detection and classification.** A drive is recognised on attach, the disc is
-identified (DVD-Video, DVD-Audio, a DVD carrying both zones, BD-Video, Video
-CD, Super Video CD, CD-Audio, or data), and a tile appears in the browser with
-the disc title — two tiles for a DVD, one per way of playing it (§6). One
-group of tiles per drive: several drives can be attached at once, each is
-classified in turn, and the groups are ordered by device name so that the
-asynchronous order in which permissions are granted does not decide where a
-disc's tiles land. Identification is the contrib's, not the module's, and it
-probes in ascending order of cost: `READ TOC` for an audio CD first, then one
-mount of the UDF filesystem answering for every DVD zone and for BD, then —
-only on the discs the first two did not claim, *and* only on media the first
-step established is a CD at all — a minimal ISO9660 walk for the two
-Video CD kinds. Each step reads the filesystem the corresponding reader will
-itself use, which is why the two walks are different rather than one being a
-fallback for the other (§6). The `READ TOC` of step 1 answers three questions
-at once for the price of one command: is this an audio CD, is it a CD, and
-where does its first data track start — so a data DVD never pays for the
-ISO9660 walk, and the walk addresses the track rather than the medium. Hot-plug
-and hot-unplug are handled, including multi-function enclosures where Android
-enumerates each function as a separate attach event.
-
-**Transport.** Bulk-Only Transport with the interface and endpoints resolved
-from the descriptor, Mass Storage Reset, spin-up wait with a bounded budget,
-LUN discovery for combo drives, a retry policy keyed on what the command
-actually is, and sense-code classification precise enough to tell a scrambled
-sector from a lost key session from a region mismatch.
-
-**A drive that leaves the bus is told apart from one that is merely failing,
-and remembered.** Unplugging mid-playback used to be indistinguishable from an
-I/O error — which invites a retry — so every read spent its whole budget, six
-attempts over two and a half seconds, rediscovering the same thing. Three
-changes settle it. The condition has its own status, `LASER_ERR_NO_DEVICE`,
-kept apart from `LASER_ERR_IO` precisely because one invites a retry and the
-other must not. It is established even when libusb cannot name it: some
-controllers report a plain I/O error rather than "no device", so a command
-whose CBW could not be handed over on *any* attempt is treated as gone — a
-31-byte transfer that fails six times over several seconds is not a busy
-bridge. And it is **latched on the registration**, so the next command fails
-without touching libusb. A drive pulled during an audio CD now takes under
-three seconds to stop rather than forty, and the demuxer's own limit — sixteen
-consecutive failed reads — is reached at the speed it was written for.
-
-**The transfer-size negotiation serves every consumer, not the one that
-discovered the limit.** It lives in the contrib and acts on the chunk actually
-put on the wire. Held in the access module instead, it protected DVD and
-Blu-ray playback while CD-Audio and Video CD — which reach the drive through
-`cdrom.c` — kept failing on hardware the other path had already tamed; and it
-narrowed a *window* that the contrib then split at 64 KiB anyway, so its first
-two steps reissued a byte-for-byte identical command.
-
-**DVD-Video playback with CSS.** The full authentication handshake runs over
-the USB transport: menus, navigation and feature playback all work. libdvdcss
-is patched at the `ioctl_*` layer only — every function keeps its signature
-and gains a branch. A CSS session is held for the lifetime of a `dvdcss_t` and
-excludes other consumers, which prevents an unrelated component from consuming
-one of the drive's four AGIDs mid-handshake.
-
-**DVD-Audio playback, including universal discs.** The Audio zone is read over
-the same byte-stream path as a DVD-Video, by a new `dvdread.c` demux submodule
-calling `DVDOpenStreamAudio()`, which the CPXM fork already provides — so the
-contrib stays unpatched. Identification tests the `DVDAUDIO-AMG` signature and
-not the directory, since many DVD-Videos ship an empty `AUDIO_TS`. A disc with
-both zones is a kind of its own, listed as two tiles, Audio first, told apart
-by their icon alone (§6). CPPM adds no SCSI command: the media key block is an
-ordinary file on the disc, read through this transport.
-
-**CD-Audio playback.** TOC read over the transport, then one playlist entry per
-track, each playing to the end and advancing to the next. This needed one
-change in `cdda.c` that has nothing to do with USB: its track sub-items were
-distinguished by input options alone, which VLC-Android drops when it rebuilds
-a sub-item from its URI, so the thirty tracks of a CD collapsed onto one MRL
-and the input looped forever (§6).
-
-**Video CD and Super Video CD playback.** Identified by ISO9660 — `/VCD/INFO.VCD`
-carrying `VIDEO_CD`, `/SVCD/INFO.SVD` carrying `SUPERVCD` — and played through
-VLC's own `vcd` module over the same `cdrom.c` path as an audio CD. The
-directory alone is never the answer: a data disc may carry a folder called
-`VCD`, so the signature inside the info file is what settles it, exactly as
-`DVDVIDEO-VMG` does for a DVD.
-
-**Raw CD sector sizes.** 2352-byte sectors have their own helper,
-`laser_read_cd_blocks()`, which issues `READ CD` and takes the sector kind as
-an argument: CD-DA with User Data only for audio, and for a Video CD every
-field including EDC/ECC, with no sector type declared. All kinds come back as
-2352 bytes per sector, so
-everything above that call is indifferent to which was asked for — including
-the Mode 2 unpacking, which `cdrom.c` already did generically for every
-platform. The 2048 check against `READ CAPACITY` lives on the `laser://`
-stream path, which no CD ever takes. The two sizes never meet.
-
-**Region mismatch explained rather than suffered.** Before the first read of a
-playback session, the drive's RPC state and the disc's region management
-information are compared, and a mismatch is reported in one sentence naming
-both regions. The two commands and the comparison rule are the contrib's — MMC
-and DVD-Video, not VLC — and what stays in the module is turning two bitmasks
-into something a person can read. Silent on a CD, a BD, a region-free disc, an
-RPC-1 drive, or a drive with no region set yet — all of which are cases where
-the two commands simply do not answer, so the check gates itself without being
-told what is in the drive.
-
-**Blu-ray playback, including a commercial AACS disc.** A BD volume is read by
-libbluray through the access module's stream rather than through a token of its
-own, so it reaches the disc over the same windowed sector reads a DVD gets. A
-commercial disc plays decrypted from a key database: libaacs finds `KEYDB.cfg`
-in shared storage, and libbluray's own `dlopen` picks up `libaacs.so.0` mapped
-out of the `org.libaacs.provider` package (below).
-
-**Getting libaacs onto the device.** libbluray loads libaacs with `dlopen`
-under the name `libaacs.so.0`, and no APK can put that name on disk: the
-package installer extracts only entries called `lib*.so`. It arrives instead
-in a second application, `org.libaacs.provider`, holding that one file per ABI
-and nothing else — and stays there, mapped out of the package rather than
-copied, `LIBAACS_PATH` holding `/data/app/…/base.apk!/lib/<abi>/libaacs`. The
-dynamic linker has accepted that form for any zip file since API 23, provided
-the entry is stored uncompressed and page-aligned, which is that APK's whole
-packaging discipline; libbluray completes the prefix with `.so.0` itself, so
-it needs no patch. The ABI directory is VLC's own, an APK declaring no
-lib*.so having no primary ABI of its own. Reaching another package at all
-needs `<queries>` naming it in VLC's manifest
-
-**Lifetime of the descriptor.** Natively the registration is
-**reference-counted**: the USB handle closes when the last claim goes, not
-when the first consumer finishes. A DVD has the access module and libdvdcss
-holding the same token, so without the count correctness would rest on libVLC
-closing the demuxer first — an ordering it provides and does not promise. On
-the Java side a classification connection is opened and closed within one
-call, while a playback connection belongs to `LaserConnections` and closes
-once no playlist names its descriptor, reconciled from
-`MediaPlayer.Event.Stopped` and from the service's teardown. A just-opened one
-is spared the next few reconciliations (§6). No location naming a descriptor
-reaches the medialibrary or the resume preferences.
-
-Against a claim never released, `laser_acquire()` **refuses** a descriptor
-that no longer names the device registered under that number — `fstat()` on
-device and inode, since numbers get reused. Re-registering instead would take
-the drive from a consumer that still believes it holds it, an entry living
-only while somebody holds it. The value is the error it logs, which names the
-cause: a strong heuristic, no substitute for releasing claims.
-
-**Throughput.** Reads are windowed and prefetched by a dedicated thread, and
-the transfer size is negotiated per device. Measured on a DVD-9: ~1 MB/s
-sustained with the drive idle 95% of the time, from ~20 SCSI commands per five
-seconds. Playback is smooth end to end. Measured again on a Blu-ray over
-USB 2.0, this time at the transport rather than at what the demuxer took:
-~15,000 KiB/s in 256 KiB reads of ~16 ms each, with the drive idle 80% of the
-time — so the ceiling on that link is the link, not this code. Both figures
-assume a well-fed drive; see §2 on what an underfed one does to them.
-
-## 6. Design decisions worth remembering
-
-| Decision                                                                                        | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-|-------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Borrow the `file://` scheme for classification                                                  | A private scheme never reaches an access module: the preparser types items from a fixed scheme table and skips anything it does not recognise.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| Refusals are recorded per LBA, not per session                                                  | A session-wide latch turned one scrambled VOB into end-of-stream for the whole disc, including the unscrambled `.IFO` files behind it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Readable prefix preserved on a refused range                                                    | A refusal applies to the whole SCSI command; a window straddling the boundary between an `.IFO` and its scrambled `.VOB` must not lose the readable part.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Retry policy keyed on key format, not opcode                                                    | `REPORT KEY` carries both state-changing handshake steps and harmless queries. Retrying an AGID request can exhaust all four AGIDs; refusing to retry a copyright query would disable CSS for the whole disc.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Transfer size negotiated, not configured — and negotiated in the contrib                        | Bridge limits vary and are not discoverable from any descriptor. Held in a consumer, the limit is learnt once per consumer: the module that met the bad bridge copes and the others do not. Held here, it also acts on the chunk actually put on the wire rather than on a window the contrib splits anyway.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| A laser MRL never enters a persistent store                                                     | It names a descriptor valid for one connection in one process. Stored, it comes back at the next launch naming a different device, an ordinary file, or nothing — a *wrong* answer rather than a missing one. The existing `fd://` guards in `PlaylistManager` were widened rather than duplicated; the symptom was an offer at startup to resume a disc that had left the building.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| The playback connection's lifetime is reconciled against the playlist, not paired with an open  | Pairing leaks whenever one half is missed, and there are many ways to miss it: playback that never starts, a demuxer that rejects the disc, an input error, the app being swiped away. Reconciliation names no exit path, so it cannot miss one. Its one blind spot is a connection just opened and not yet in any playlist, which is indistinguishable from one whose entry has gone — so a fresh connection is spared a bounded number of reconciliations rather than a bounded number of milliseconds: what has to happen first is an event, the playlist being replaced, not the passage of time.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| …and reconciled from events libVLC emits, never from a decision taken in Kotlin                 | Every module releases its token in its own `Close()`, so `MediaPlayer.Event.Stopped` is emitted only after the libusb handle has been released. Doing the same work in `stop()` would close a descriptor libusb still held. This is also why no JNI call is needed to make the ordering safe.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| A detached drive's connection is closed at once rather than left to the ordinary reconciliation | The cache is keyed by `deviceName` — `/dev/bus/usb/001/004` — and that path is REASSIGNED, so a replugged drive landing on the same bus and address finds its own stale entry and `open()` hands back a connection to a device that has gone. Reconciliation does not cover this: it is driven by the playlist, so an entry keeps a connection alive for as long as something names it, drive present or not. Hence `dropDetached()`, on `ACTION_USB_DEVICE_DETACHED`, and hence closing rather than parking: a parked connection has no second owner to close it, and the entry has already left the map that reconciliation walks. The cost is real and is paid where §5 already collects it: closing does not stop liblaser using the number, it changes what the kernel says about it — an open descriptor on an absent device answers "no device", a closed one answers "bad descriptor", which on its own reads as a transient fault and invites the retry budget. What tells the two apart here is not the error code but the other arm of `LASER_ERR_NO_DEVICE`: a command whose CBW could not be handed over on *any* attempt is treated as gone whatever libusb called it. So the drive is still distinguished from one that is merely failing, by the route that was written for controllers which misreport it. |
-| The track number is carried in the CD-Audio MRL, not only in an input option                    | `cdda.c` distinguishes tracks by options; a host that cannot carry options across a sub-item collapses them all onto one MRL and loops forever. The `/Track NN` syntax was already parsed by `DiscOpen()` — nothing emitted it. Emitted only where it round-trips, i.e. where `DiscOpen()` reads the location rather than a file path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| The drive's region is read, never set                                                           | `SEND KEY` format 06h would set it, and the counter of permitted changes is small and, once exhausted, permanent. A drive bricked into one region by a media player the user did not think was making that decision is a worse outcome than a disc that will not play. The check is advisory and cannot refuse a disc.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| A DVD is listed twice, with menus and without                                                   | dvdnav is the right default — it is what the disc's author intended and what a DVD player does. But a disc whose navigation it cannot follow plays as a black screen through it and plays fine through the plain reader, and which of the two a given disc needs is a judgement only the person watching can make. So it is offered as a second row rather than guessed at, or buried in a long-press menu. The cost was a stream-based `demux` submodule in `dvdread.c`, which had only ever been an `access_demux` — reachable by name (`dvdsimple`) and never probed, so that "no menus" is asked for and never inferred.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| Disc identification lives in the contrib, behind `laser_disc_identify()`                        | It reads sectors and issues one SCSI command; none of it is VLC's, and any consumer holding a token wants the same answer. The move also let libudfread stop being installed — a vendored dependency has no business in the interface of the library that vendors it — and let the hand-rolled ISO9660 walk be dropped from the DVD path: DVD-Video discs carry both filesystems, but libdvdread finds its files through UDF and never falls back, so identifying through UDF is identifying through what the reader will actually use. **Video CD later brought an ISO9660 walk back — and that is the same rule reaching a different answer, not a reversal of it:** a VCD has no UDF at all and VLC's `vcd` module reads it through ISO9660, so "identify through the filesystem the reader uses" now selects ISO9660 there and still selects UDF for a DVD. The walk is two directory levels deep and stops: no Joliet, no Rock Ridge, no recursion, no path table, because those exist to find arbitrary names and this looks up two it already knows.                                                                                                                                                                                                                                                                 |
-| A Video CD is routed like an audio CD, not like a DVD                                           | What decides the path is the sector, not the content. A VCD's payload is Mode 2 Form 2, read with `READ CD`; a `stream_t` hands out a flat run of 2048-byte blocks and can express neither that nor a raw CD-DA sector. So the MRL names VLC's `vcd` access module rather than ours, and the disc never touches the `laser://` stream path — the same reasoning that kept CD-Audio off it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `laser_read_cd_blocks()` took a sector-kind argument rather than being duplicated               | `READ CD` carries the answer in two unrelated CDB bytes — an Expected Sector Type and a field-selection bitmap — whose legal pairings are a property of the CD format, not of any caller. The parameter is an enum naming the *sector kind*, so the pairing stays in one place and no caller can invent a combination it has no way to validate.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `vcd.c` needed a location fallback that `cdda.c` did not                                        | `psz_filepath` comes from `vlc_uri2path()`, which answers "what file does this URI name" — and `laser/5` names no file: it is a descriptor reaching the drive over SCSI, not through the filesystem. `cdda.c` already falls back from the path to the location, because it had to support the GNOME `…/Track NN` syntax, and that fallback carries the token for free. `vcd.c` never grew an equivalent because it never had a second syntax to support — so the asymmetry is in VLC, not an oversight here.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| VCD and SVCD are two MRLs but one Kotlin disc type                                              | The MRL is what a bug report quotes and what names the access module, so `svcd://` for a Super Video CD costs nothing and is true. The Kotlin enum answers "what kind of disc" for the icon and the playback flags, and neither acts on the difference — exactly as `dvd` and `dvdsimple` are two MRLs and one `DVD_VIDEO`. A finer distinction stays available by testing the MRL, the way `isLaserNoMenuMrl()` does.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| A universal DVD's two tiles are distinguished by their icon, not by their label                 | Both rows carry the bare disc title, so the icon in `BaseBrowserAdapter.getIcon()` is the only thing separating them — which is why `DVD_AUDIO` is a Kotlin disc type of its own while `dvd` and `dvdsimple` share one: this is the single distinction among the DVD MRLs that a consumer acts on. Folding it in with the video kinds, on the reasoning that a DVD-Audio disc is a DVD, would render a universal disc as one row shown twice. The `when` has no `else`, so a NEW enum value breaks the build — but nothing stops an existing value being put in the wrong arm, which is why the constraint is written at both ends, in `laser.c`'s universal case and in `getIcon()` itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| The libaacs patch touches no MMC code                                                           | An Android application cannot reach a drive through libaacs' own device layer in the first place — `mmc_device_linux.c` opens a device node, and there is none. It already degrades correctly there: `device_open()` fails and a disc whose key is in a database opens anyway. So the patch fixes only what actually prevents libaacs from working on Android — that it has no `$HOME` to look for that database in, and no visible stderr to say so on. Adding an MMC path is a separate chantier and is described as one (§7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| libbluray takes no token                                                                        | `bd_open_stream()`'s `read_blocks` callback is VLC's own, reading the demuxer's stream — i.e. the access module, already a consumer. There is no second path to build, and adding one "for symmetry" with libdvdcss would create a double release. The consequence is that libbluray reaches the disc but not the drive (§7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Device registrations are reference-counted, and claims are declared rather than inferred        | A token has several consumers at once; without a count the first one out tore the device down for the others, and that this was harmless rested on libVLC's teardown order rather than on anything enforced. Counting was rejected once, on the grounds that "never released" is a worse failure than "released too early" on a descriptor Kotlin is waiting to close — an argument that stopped holding when `LaserConnections` started reconciling connections against the playlist, since that is exactly a backstop against a leaked claim. `laser_acquire()` is now the only thing that registers a device at all: every other entry point looks the token up and answers `LASER_ERR_NO_SUCH_TOKEN` if there is none. Commands used to register their own device on the spot, which produced registrations no consumer had claimed — and since teardown only happens when a count falls to zero, a count never incremented never falls, so nothing could ever destroy them. Every consumer already acquired first, so removing that path cost no call site anything; what it removed was a state nothing could get out of.                                                                                                                                                                                             |
-| Nothing but `laser_*` leaves `liblaser.a`                                                       | libbluray bundles its own copy of libudfread, exporting the same `udfread_*` names, and an Android VLC links both archives — so which copy satisfies a given reference becomes a property of archive member ordering. The three object sets are therefore partially linked into one relocatable object, and everything outside the documented API is demoted to local. Per-object `objcopy` cannot do this: localizing `laser_lookup()` in `registry.o` would break `scsi.o`, `laser_bot_send_locked()` crosses from `bot.o` to `scsi.o`, and libusb's files call into each other throughout. The link step asserts both directions — that nothing foreign escaped, and that every declared entry point is actually defined, since `objcopy --keep-global-symbol=` on a name that does not exist is ignored without a word.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Cancellation belongs to the last release, not to a public call                                  | The flag is sticky and token-wide, while a claim is one of several: a public cancel would let one consumer disable the drive for every other holder of the same token, permanently — reintroducing exactly the teardown-ordering dependency the count exists to remove. Cancelling always meant "I am the last one out and I am done", which is what dropping the last claim already says, so that is where it lives. Sticky removes the question of who clears it, the slot being memset moments later. Checked between attempts and between chunks, never inside a transfer already in flight. What not exposing it costs: a `Close()` whose read-ahead worker sits inside a block read on a wedged drive now waits out a full retry budget rather than one phase timeout, `b_quit` being read only between two reads. Getting to zero means libusb's asynchronous API.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Diagnostics go through a callback                                                               | A library that has decided where its logs go has decided it for every application that embeds it. `laser_set_log_cb()` defaults to Android's logger, which is right inside the app and useless — and unsilenceable — anywhere else. Same shape as libbluray's `bd_set_debug_handler()`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| libbluray reaches libaacs by `dlopen`, so a second package carries it and VLC never copies it   | libbluray does not link libaacs; it opens `libaacs.so.0` at runtime, and nothing can put that name on disk — the installer extracts only `lib*.so`. So the library cannot ship inside VLC, and it cannot be extracted from any other APK either. What it can do is stay inside an APK that is never extracted at all: `LIBAACS_PATH` holds `…/base.apk!/lib/<abi>/libaacs`, libbluray appends `.so.0`, and the linker maps the entry straight out of the provider's package. VLC writes nothing and holds no copy, which is what keeps it out of the business of distributing a libaacs binary: it names a file inside a package somebody else installed. The same `.so` suffix rule bites three times on the way there — in the installer, in `zipalign -p`, and in `apksigner` — which is why the provider APK is built by hand rather than by Gradle (§5).                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| libaacs' key cache goes to private storage, its key database does not                           | `file_get_cache_home()` would otherwise put the keys libaacs derives beside `KEYDB.cfg` in shared storage, readable by any application holding *All files access* and surviving the uninstall. The two directories are asymmetric on purpose: a human has to be able to drop the database in, and nothing has to be able to read the cache out. `XDG_CACHE_HOME` is the redirection libaacs already honours, so it costs one `setenv` and no patch.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| One tile group per drive, ordered by device name                                                | The browser used to stop at the first drive holding a disc, which meant a second drive was never even classified. Classification is now queued and serial — two overlapping passes would stack two system permission dialogs — but nothing is dropped, which removes the hand-rolled re-entry that used to catch the candidates the previous gate turned away. Display order comes from sorting device names rather than from arrival, since arrival order depends on which permission dialog the user answers first and would move a disc's tiles between two launches.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| The kernel driver is detached and given back only for a device we decline                       | An optical drive's interface is claimed before INQUIRY can say what the device is, so the driver is already detached when a USB key turns out not to be one - and leaving it that way would take the user's flash drive off the system for nothing. It is re-attached on that path. A drive we KEEP is never given back until it is unplugged: `libusb_set_auto_detach_kernel_driver()` restores the driver on every release, and on a kernel that mounts optical media that means re-binding, re-mounting and a fresh conversation with the drive between two of ours. Observed as two Reset Recoveries and three INQUIRY attempts per registration, with the disc walk then failing on an unsettled drive - the first classification of a session working and every later one not. The cost is that /storage/sr0 stays gone until the drive is unplugged (§2).                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-
-## 7. Remaining work
+## 5. Remaining work
 
 ### Functional
 
@@ -444,14 +263,14 @@ assume a well-fed drive; see §2 on what an underfed one does to them.
   MMC commands of its own — the Volume ID above all — which a stream cannot
   carry. Making those discs play means giving libaacs the treatment libdvdcss
   got: a device handle routed through the contrib, plus the equivalent of the
-  CSS session exclusion. This is a chantier on the scale of the whole CSS
+  [CSS](#7-acronyms) session exclusion. This is a chantier on the scale of the whole CSS
   effort, not a wiring job, and it is unchanged by the patch below — which
-  deliberately touches no MMC code (§6).
+  deliberately touches no MMC code.
 
 ### Dormant
 
 - **Layer break awareness.** `READ DVD STRUCTURE` format `00h` gives the layer
-  break address and the PTP/OTP direction of a dual-layer disc. Aligning
+  break address and the [PTP](#7-acronyms)/[OTP](#7-acronyms) direction of a dual-layer disc. Aligning
   windows so they do not straddle it would avoid a mechanical seek per
   crossing. With the drive idle 95% of the time, this is theoretical.
 - **Recovery of latched refusals after a successful authentication.** A sector
@@ -459,7 +278,7 @@ assume a well-fed drive; see §2 on what an underfed one does to them.
   clean fix is a generation counter on the CSS session, sampled on each read.
   Rarely reachable in practice, since authentication happens during open.
 - **Video CD in a later session.** The ISO9660 walk now addresses the *track*:
-  it reads sector 16 relative to the first data track's start LBA, taken from
+  it reads sector 16 relative to the first data track's start [LBA](#7-acronyms), taken from
   the table of contents step 1 has already fetched, so it costs no extra
   command. What is still out of reach is a filesystem living in a later
   *session* of a multi-session disc — format 0 of `READ TOC` reports tracks,
@@ -473,7 +292,7 @@ assume a well-fed drive; see §2 on what an underfed one does to them.
   handling of a true mixed-mode disc is ambiguous enough (play the audio
   tracks? mount the data track?) that guessing would be worse.
 
-## 8. Reference documents
+## 6. Reference documents
 
 ### Platform — how the descriptor arrives
 
@@ -484,7 +303,7 @@ assume a well-fed drive; see §2 on what an underfed one does to them.
 
 ### Transport — how to talk to the drive
 
-- **USB Mass Storage Class — Bulk-Only Transport (BBB), rev 1.0** — CBW/CSW
+- **USB Mass Storage Class — Bulk-Only Transport ([BBB](#7-acronyms)), rev 1.0** — CBW/CSW
   framing, the thirteen host/device data-transfer cases, stall recovery, Reset
   Recovery, Phase Error semantics. Governs `bot.c`, and the interface and
   endpoint discovery and Mass Storage Reset in `usb.c`.
@@ -493,11 +312,11 @@ assume a well-fed drive; see §2 on what an underfed one does to them.
 - **USB Mass Storage Class Specification Overview, rev 1.4** — subclass and
   protocol code assignments; what makes an interface the mass-storage one.
   <https://www.usb.org/sites/default/files/Mass_Storage_Specification_Overview_v1.4_2-19-2010.pdf>
-- **INCITS T10 MMC / SPC / SBC** — the SCSI command set itself: `READ(10)` and
+- **[INCITS](#7-acronyms) [T10](#7-acronyms) MMC / [SPC](#7-acronyms) / [SBC](#7-acronyms)** — the SCSI command set itself: `READ(10)` and
   `READ CD`, `READ TOC`, `REPORT KEY` / `SEND KEY`, `READ DISC STRUCTURE`
   (`READ DVD STRUCTURE` in earlier editions, and the command that would carry
   a BD Volume ID), `GET CONFIGURATION`, `REQUEST SENSE`, and the sense key /
-  ASC / ASCQ tables. Working drafts are freely downloadable; ratified INCITS
+  [ASC](#7-acronyms) / [ASCQ](#7-acronyms) tables. Working drafts are freely downloadable; ratified INCITS
   editions are not, and the final draft matches the published text for our
   purposes. Pin a revision when citing: the project relies on MMC-3 or later.
   <https://www.t10.org/drafts.htm>
@@ -509,10 +328,10 @@ assume a well-fed drive; see §2 on what an underfed one does to them.
 ### Content protection
 
 - **AACS — *Advanced Access Content System*, Common Cryptographic Elements**
-  — the specification libaacs implements: Volume ID, Media Key Block, VUK,
+  — the specification libaacs implements: Volume ID, Media Key Block, [VUK](#7-acronyms),
   and the fact that the Volume ID is obtained by an MMC command and not read
   from the filesystem, which is the whole reason a key database and a drive
-  handshake are two separate paths (§7).
+  handshake are two separate paths (§5).
   <https://aacsla.com/specifications/>
 - **Android storage** — scoped storage, primary shared storage, and
   `MANAGE_EXTERNAL_STORAGE`. What decides where a key database can live on a
@@ -532,9 +351,9 @@ assume a well-fed drive; see §2 on what an underfed one does to them.
   free.
   <https://ecma-international.org/publications-and-standards/technical-reports/ecma-tr-71/>
 - **ECMA-167, *Volume and file structure … non-sequential recording*** (3rd ed.;
-  ISO/IEC 13346) — the normative base for UDF. Free.
+  ISO/IEC 13346) — the normative base for [UDF](#7-acronyms). Free.
   <https://ecma-international.org/publications-and-standards/standards/ecma-167/>
-- **OSTA UDF** — 1.02 is the profile a DVD-Video actually requires, in
+- **[OSTA](#7-acronyms) UDF** — 1.02 is the profile a DVD-Video actually requires, in
   UDF/ISO 9660 bridge form, which is why an ECMA-119 (ISO 9660) structure is
   present on the same volume; a BD-ROM requires 2.50. Both are what libudfread
   implements, and libbluray reads a BD volume through it, on top of the access
@@ -558,38 +377,27 @@ assume a well-fed drive; see §2 on what an underfed one does to them.
   anyone extending beyond identification — the `ENTRIES` and `LOT` structures
   in particular are described nowhere else.
 
-## 9. Acronyms
+## 7. Acronyms
 
 | Acronym      | Meaning |
 | ------------ | ------- |
 | AACS         | Advanced Access Content System. Blu-ray's content protection, implemented by libaacs. |
-| ABI          | Application Binary Interface. Which machine code an Android device will load. |
-| AGID         | Authentication Grant ID. The handle a drive issues for one CSS handshake; a drive has four and leaks them if a request is retried. |
-| AMG          | Audio Manager. The DVD-Audio zone's `AUDIO_TS.IFO`, identified by its `DVDAUDIO-AMG` magic. |
 | ASC / ASCQ   | Additional Sense Code and its Qualifier. The two bytes that say what a SCSI command actually failed on; the sense key alone rarely does. |
 | BBB          | Bulk/Bulk/Bulk. The USB Mass Storage specification's own name for Bulk-Only Transport, and the reason its protocol code is what it is. |
 | BOT          | Bulk-Only Transport. The USB Mass Storage transport this library speaks, and what `bot.c` is named after. |
 | CBW / CSW    | Command Block Wrapper and Command Status Wrapper. The header that carries a CDB out and the trailer that reports what happened, one pair per transaction. |
 | CDB          | Command Descriptor Block. The SCSI command itself, 6 to 16 bytes, riding inside a CBW. |
-| CD-DA        | Compact Disc Digital Audio. Red Book audio: no filesystem, hence no volume label. |
-| CPPM         | Content Protection for Prerecorded Media. DVD-Audio's scheme, and unlike CSS it adds no SCSI command. |
-| CPXM         | CPPM and CPRM taken together — the name the libdvdcss fork uses for the implementation behind `dvdcpxm.h`. |
 | CSS          | Content Scramble System. DVD-Video's protection. Nothing to do with stylesheets. |
-| EDC / ECC    | Error Detection Code and Error Correction Code. The trailer on a raw CD sector, and the reason a raw read can come back 2072 or 2348 bytes instead of 2352. |
-| IFO          | The DVD "information" file extension — `VIDEO_TS.IFO` and friends, unscrambled even on a protected disc. |
 | LBA          | Logical Block Address. A sector number, counted from the start of the medium unless something says otherwise. |
 | LUN          | Logical Unit Number. Which unit behind one USB device a command is addressed to; an optical drive is rarely LUN 0 on a multi-slot bridge. |
 | MMC          | Multi-Media Commands. The SCSI command set for optical drives. Not MultiMediaCard, which is a different thing entirely. |
 | MRL          | Media Resource Locator. VLC's URI-like string naming both what to open and which module opens it. |
 | OSTA         | Optical Storage Technology Association. Publishes UDF. |
 | PTP / OTP    | Parallel Track Path and Opposite Track Path. Which direction the second layer of a dual-layer DVD is read in. |
-| RPC          | Region Playback Control. RPC-1 names a drive that enforces no region itself. |
 | SBC / SPC    | SCSI Block Commands and SCSI Primary Commands. The two command sets MMC sits on top of. |
 | SCSI         | Small Computer System Interface. The command language, still spoken by every optical drive whatever it is plugged into. |
 | T10 / INCITS | The technical committee that publishes the SCSI standards, and the body it belongs to. |
 | TOC          | Table of Contents. A CD's track list, read with one command and the only cheap way to know a medium is a CD. |
 | UDF          | Universal Disk Format. The filesystem on every DVD and Blu-ray, and the one libdvdread actually reads. |
 | VCD / SVCD   | Video CD and Super Video CD. MPEG-1 and MPEG-2 video on a CD, read through ISO9660. |
-| VMG          | Video Manager. The DVD-Video zone's `VIDEO_TS.IFO`, identified by its `DVDVIDEO-VMG` magic. |
-| VOB          | Video Object. A DVD-Video payload file, and the part of the disc that is scrambled. |
 | VUK          | Volume Unique Key. The per-disc key AACS derives before anything can be decrypted. |

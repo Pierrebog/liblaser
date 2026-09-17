@@ -115,7 +115,10 @@ typedef struct {
  *
  * A token whose last claim is being dropped concurrently yields
  * LASER_DISC_UNKNOWN - the same answer as an unreadable disc, for the same
- * reason the enum gives one value to three situations.
+ * reason the enum gives one value to three situations. So does a token whose
+ * drive never became ready (laser_token_not_ready()): the readiness wait has
+ * already been patient on that drive's behalf, and each probe below would pay
+ * its own retry budget to reach the same verdict.
  *
  * BEST EFFORT, AND NEVER FATAL. @p out is always filled: an unreadable or
  * unrecognised disc yields LASER_DISC_UNKNOWN and an empty volume_id, which

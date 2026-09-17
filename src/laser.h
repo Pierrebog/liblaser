@@ -365,6 +365,27 @@ laser_status_t laser_acquire(int token);
  */
 void laser_release(int token);
 
+/**
+ * Whether the drive behind @p token ended its readiness wait without ever
+ * answering ready.
+ *
+ * laser_acquire() waits for the medium before publishing the token, spending
+ * up to LASER_SPINUP_MAX_WALL_MS on a drive that keeps answering "not yet".
+ * A drive that never settled in that time answers every subsequent command
+ * the same way, each one paying its own retry budget to find out - so this
+ * says, in one lookup and no commands, that further probing is not worth its
+ * cost. laser_disc_identify() checks it for exactly that reason.
+ *
+ * ADVISORY, NOT A VERDICT: registration succeeds either way, and nothing here
+ * refuses a command on the strength of it. A drive that never reported ready
+ * can still read, and a consumer with a reason to try anyway should.
+ *
+ * @param token the registry token (the fd)
+ * @return 1 if the token is registered and its drive never became ready,
+ *         0 otherwise - including for a token that is not registered.
+ */
+int laser_token_not_ready(int token);
+
 /* ============================================================================
  * Low-level: one raw SCSI CDB, one BOT transaction
  * ============================================================================ */

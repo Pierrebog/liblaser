@@ -194,6 +194,12 @@ laser_entry_t *laser_lookup(int token)
     return found;
 }
 
+int laser_token_not_ready(int token)
+{
+    laser_entry_t *entry = laser_lookup(token);
+    return entry != NULL && entry->not_ready;
+}
+
 /** The cancellation flag's only two accessors, kept together so the asymmetry
  * between them is visible in one place: the write is serialized, the read is
  * not. See the field's comment in laser_internal.h for why that is sound -

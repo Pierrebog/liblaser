@@ -106,6 +106,12 @@
 #define SCSI_ASCQ_CP_REGION_MISMATCH    0x04
 #define SCSI_ASCQ_CP_REGION_PERMANENT   0x05
 
+/* 04h/01h: the drive has a medium and is bringing it up to speed. Not a
+ * branch in the wait - it is simply "not ready yet", handled by the generic
+ * tail - but recorded, because a drive that leaves the bus having said this
+ * was drawing spindle current when it went. */
+#define SCSI_ASC_BECOMING_READY         0x04
+
 #define SCSI_ASC_MEDIUM_NOT_PRESENT     0x3a
 /* The qualifiers under 3Ah, which do NOT all mean the same thing and must not
  * be handled as though they did.
@@ -454,6 +460,11 @@ static int start_stop_unit_locked(laser_entry_t *entry,
  *   2c. anything else -> retry with LOEJ. A refusal that names neither the
  *       opcode nor a field is the drive declining on its own terms, and
  *       "load the medium" is a different request from "spin what you have".
+ *       05h/24h HERE names LOEJ, not IMMED - it is the bit this shape adds -
+ *       so the ladder ends: a drive with no motorised load refuses it with
+ *       IMMED set or clear alike. Tried and measured on a 152d:0583 bridge,
+ *       which answered both shapes identically; the extra command bought
+ *       nothing and every trayless drive would have paid for it.
  *
  * NEVER on 3Ah/02h: LOEJ closes a tray, and the caller must not reach here
  * with the tray open. Best-effort throughout - a drive that refuses every
@@ -582,13 +593,11 @@ static void log_media_status_locked(laser_entry_t *entry)
  * can close; and the device having left the bus altogether, which TEST
  * UNIT READY now reports distinctly rather than as one more "not ready".
  *
- * The other MEDIUM NOT PRESENT qualifiers used to end it too, and that was
- * wrong. 3Ah/00h and 3Ah/01h are what a parked drive answers about a disc
- * in its own closed tray, so treating them as conclusive rejected valid
- * discs - and the more so because this loop, by itself, never gave such a
- * drive anything to change its mind about. Hence spin_up_locked(): on the
- * first of those answers the drive is told to load, ONCE, and the poll then
- * carries on under its own shorter ceiling (LASER_NO_MEDIUM_MAX_WALL_MS).
+ * The other MEDIUM NOT PRESENT qualifiers do not end it either. 3Ah/00h and
+ * 3Ah/01h are what a parked drive answers about a disc in its own closed
+ * tray, so treating them as conclusive rejected valid discs; the poll
+ * carries on under its own shorter ceiling (LASER_NO_MEDIUM_MAX_WALL_MS),
+ * measured from the START STOP UNIT below.
  *
  * Best-effort: a drive that never reports ready still falls through to
  * the caller, which will find out soon enough when its first real read
@@ -609,6 +618,29 @@ void laser_wait_until_ready(laser_entry_t *entry)
 
     pthread_mutex_lock(&entry->io_lock);
 
+    /* Sent before the drive is asked anything, rather than on a first answer
+     * that happens to be 3Ah. Polling with TEST UNIT READY does not start
+     * every mechanism: a drive reporting 02h/04h/01h - becoming ready - as a
+     * generic busy state never reaches the no-medium branch below, so nothing
+     * ever tells it to load and the wait polls a drive that was never
+     * started, until the budget runs out. Asking first costs one command on a
+     * drive that did not need it, which its own escalation ladder ends at the
+     * first good status. */
+    spin_up_locked(entry);
+    spun_up = 1;
+    clock_gettime(CLOCK_MONOTONIC, &no_medium_since);
+
+    /* Raised for the duration and lowered only by the ready return below, so
+     * that every way out of this loop other than success leaves it standing,
+     * including ones added later. Also clears it on a re-registration of a
+     * reused slot. */
+    entry->not_ready = 1;
+
+    /* Whether the drive has told us it is spinning up. Only read by the
+     * device-gone branch below, which needs to say what the drive was doing
+     * when it vanished. */
+    int becoming_ready = 0;
+
     /* NOT CANCELLABLE, and it cannot be: this runs inside laser_acquire(),
      * under g_registry_lock, on an entry that has not been published yet - so
      * nothing can look the token up, and cancellation is set only by the
@@ -624,6 +656,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
             LOGI("token=%d: unit ready (attempt %d/%d, %ldms)",
                  entry->token, attempt, LASER_SPINUP_MAX_ATTEMPTS,
                  monotonic_ms_since(&started));
+            entry->not_ready = 0;
             pthread_mutex_unlock(&entry->io_lock);
             return;
         }
@@ -636,6 +669,22 @@ void laser_wait_until_ready(laser_entry_t *entry)
              * honest outcome either way. */
             LOGW("token=%d: device gone during spin-up wait, abandoning it",
                  entry->token);
+
+            /* A drive that left the bus WHILE SPINNING UP is the signature of
+             * a supply that cannot carry the spindle: a cold optical drive
+             * draws its peak current getting the disc up to speed, and a port
+             * that cannot deliver it browns the bridge out mid-command. The
+             * device then re-enumerates at a new address and the cycle
+             * repeats, audibly. Worth naming, because every layer above sees
+             * only a device that disappeared - and because nothing in this
+             * library can fix it, while a powered hub can. */
+            if (becoming_ready) {
+                LOGW("token=%d: it was spinning up when it went (%ldms in) - "
+                     "suspect the port's power budget, not the drive: try a "
+                     "powered hub or a Y-cable",
+                     entry->token, monotonic_ms_since(&started));
+            }
+
             pthread_mutex_unlock(&entry->io_lock);
             return;
         }
@@ -650,6 +699,11 @@ void laser_wait_until_ready(laser_entry_t *entry)
         LOGI("token=%d: sense %02x/%02x/%02x (attempt %d/%d)",
              entry->token, sense_key, asc, ascq, attempt,
              LASER_SPINUP_MAX_ATTEMPTS);
+
+        if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
+            asc == SCSI_ASC_BECOMING_READY) {
+            becoming_ready = 1;
+        }
 
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {

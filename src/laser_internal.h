@@ -360,6 +360,15 @@ typedef struct {
     pthread_cond_t  css_cv;
     int             css_open;
     const void     *css_owner;
+
+    /* Set while laser_wait_until_ready() is running and cleared the moment
+     * the unit answers ready, so it survives only on an entry whose wait ran
+     * out - a drive that spent its whole budget saying "not yet", or one with
+     * an open tray. Registration still succeeds: a drive that never reported
+     * ready can still read, and refusing it here would stop it trying. What
+     * reads it is laser_disc_identify(), which would otherwise spend a second
+     * budget per command rediscovering the same answer. */
+    int             not_ready;
 } laser_entry_t;
 
 /**
