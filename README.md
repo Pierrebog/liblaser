@@ -11,7 +11,7 @@ Android grants userspace access to a USB device as a file descriptor obtained
 through `UsbManager`. There is no block device, no mount point, and no
 `/dev/sr0`: everything VLC's optical stack normally relies on is absent. The
 work is therefore to give that stack a path to a drive it can only reach by
-sending SCSI command blocks over USB bulk endpoints itself.
+sending [SCSI](#7-acronyms) command blocks over USB bulk endpoints itself.
 
 ## 2. User's manual
 

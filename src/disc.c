@@ -29,6 +29,7 @@
 
 #include "laser.h"
 #include "laser_disc.h"
+#include "laser_internal.h"   /* LOGI/LOGW only: this file speaks no SCSI */
 
 #include <udfread.h>
 #include <blockinput.h>
@@ -225,28 +226,52 @@ static udf_disc_t detect_udf_disc(int token, char *volume_id)
 
     udfread *udf = udfread_init();
     if (udf == NULL)
-        return UDF_DISC_NONE;
-
-    if (udfread_open_input(udf, &sbi.base) == 0)
     {
-        if (udf_zone_present(udf, UDF_VIDEO_ZONE_IFO, UDF_VIDEO_ZONE_MAGIC))
+        LOGW("token=%d: udfread_init() failed", token);
+        return UDF_DISC_NONE;
+    }
+
+    int udf_ret = udfread_open_input(udf, &sbi.base);
+    if (udf_ret != 0)
+    {
+        /* The one place a DVD is decided, so the one worth naming when it
+         * does not happen: everything below runs on an open volume. */
+        LOGI("token=%d: no UDF volume (udfread_open_input returned %d, "
+             "medium %s)", token, udf_ret, sbi.gone ? "gone" : "present");
+    }
+    else
+    {
+        bool has_video = udf_zone_present(udf, UDF_VIDEO_ZONE_IFO,
+                                          UDF_VIDEO_ZONE_MAGIC);
+        LOGI("token=%d: UDF volume opened, %s: %s", token,
+             UDF_VIDEO_ZONE_IFO, has_video ? "present" : "absent");
+
+        if (has_video)
         {
-            kind = udf_zone_present(udf, UDF_AUDIO_ZONE_IFO,
-                                    UDF_AUDIO_ZONE_MAGIC)
-                 ? UDF_DISC_DVD_UNIVERSAL : UDF_DISC_DVD_VIDEO;
+            bool has_audio = udf_zone_present(udf, UDF_AUDIO_ZONE_IFO,
+                                              UDF_AUDIO_ZONE_MAGIC);
+            LOGI("token=%d: %s: %s", token, UDF_AUDIO_ZONE_IFO,
+                 has_audio ? "present" : "absent");
+            kind = has_audio ? UDF_DISC_DVD_UNIVERSAL : UDF_DISC_DVD_VIDEO;
         }
         else
         {
             UDFFILE *f = udfread_file_open(udf, "/BDMV/index.bdmv");
+            LOGI("token=%d: /BDMV/index.bdmv: %s", token,
+                 f != NULL ? "present" : "absent");
             if (f != NULL)
             {
                 kind = UDF_DISC_BD;
                 udfread_file_close(f);
             }
-            else if (udf_zone_present(udf, UDF_AUDIO_ZONE_IFO,
-                                      UDF_AUDIO_ZONE_MAGIC))
+            else
             {
-                kind = UDF_DISC_DVD_AUDIO;
+                bool has_audio = udf_zone_present(udf, UDF_AUDIO_ZONE_IFO,
+                                                  UDF_AUDIO_ZONE_MAGIC);
+                LOGI("token=%d: %s: %s", token, UDF_AUDIO_ZONE_IFO,
+                     has_audio ? "present" : "absent");
+                if (has_audio)
+                    kind = UDF_DISC_DVD_AUDIO;
             }
         }
 
@@ -668,7 +693,11 @@ static cd_toc_t read_cd_toc(int token, uint32_t *first_data_lba)
     laser_status_t st = laser_scsi_cdb(token, cdb, sizeof(cdb),
                                        toc, sizeof(toc), 1, &actual_len);
     if (st != LASER_OK || actual_len < 4 + 8)
+    {
+        LOGI("token=%d: READ TOC unanswered (status %d, %d bytes) - not a CD, "
+             "or the drive does not implement it", token, (int)st, actual_len);
         return CD_TOC_NONE; /* not a CD, or drive doesn't support READ TOC */
+    }
 
     /* Cross-check against the TOC's own length field rather than relying
      * on the transport's byte count alone. A TOC reply starts with a
@@ -731,6 +760,24 @@ static cd_toc_t read_cd_toc(int token, uint32_t *first_data_lba)
  * Public entry point
  * ============================================================================ */
 
+/* For the log line at the end of laser_disc_identify() only: an enum value in
+ * a log is a number someone has to look up. */
+static const char *laser_disc_kind_name(laser_disc_kind_t kind)
+{
+    switch (kind)
+    {
+        case LASER_DISC_CD_AUDIO:      return "audio CD";
+        case LASER_DISC_DVD_VIDEO:     return "DVD-Video";
+        case LASER_DISC_DVD_AUDIO:     return "DVD-Audio";
+        case LASER_DISC_DVD_UNIVERSAL: return "universal DVD";
+        case LASER_DISC_BD_VIDEO:      return "BD-Video";
+        case LASER_DISC_VCD:           return "Video CD";
+        case LASER_DISC_SVCD:          return "Super Video CD";
+        case LASER_DISC_UNKNOWN:       break;
+    }
+    return "unknown";
+}
+
 void laser_disc_identify(int token, laser_disc_t *out)
 {
     /* Zeroed first, so that every early return below - and every path that
@@ -746,6 +793,7 @@ void laser_disc_identify(int token, laser_disc_t *out)
      * drive's behalf; repeating it three times over only delays the same
      * verdict. */
     if (laser_token_not_ready(token)) {
+        LOGI("token=%d: drive never became ready, not probing the disc", token);
         return;
     }
 
@@ -754,6 +802,10 @@ void laser_disc_identify(int token, laser_disc_t *out)
      * later steps depend on the answer, which is why it goes first. */
     uint32_t track_lba = 0;
     cd_toc_t toc = read_cd_toc(token, &track_lba);
+    LOGI("token=%d: READ TOC says %s (first data track at LBA %u)", token,
+         toc == CD_TOC_AUDIO ? "audio CD"
+         : toc == CD_TOC_DATA ? "data CD" : "not a CD",
+         track_lba);
 
     if (toc == CD_TOC_AUDIO)
     {
@@ -822,4 +874,7 @@ void laser_disc_identify(int token, laser_disc_t *out)
             }
             break;
     }
+
+    LOGI("token=%d: identified as %s, volume id \"%s\"", token,
+         laser_disc_kind_name(out->kind), out->volume_id);
 }
