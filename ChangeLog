@@ -1,4 +1,4 @@
-2026-XX-XX: Version 0.2
+2026-09-19: Version 0.2
     - Rework of the interface between liblaser and the laser module - breaks compatibility with v0.1
     - Working support for VCD, DVD-Audio and Blu-ray
     - Bug fixes
