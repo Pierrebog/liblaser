@@ -901,6 +901,9 @@ static void teardown_entry_locked(laser_entry_t *entry)
 {
     int token = entry->token;
 
+    if (!entry->device_gone)
+        laser_mass_storage_reset(entry);
+
     /* See the threading contract in laser.h: the caller guarantees no
      * transaction is in flight on this token any more by the time the last
      * claim is dropped, so it is safe to tear down without acquiring
