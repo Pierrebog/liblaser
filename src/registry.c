@@ -46,8 +46,10 @@
  *****************************************************************************/
 
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -164,6 +166,25 @@ void laser_log(laser_log_level_t level, const char *fmt, ...)
         cb(g_log_opaque, level, line);
     else
         default_log_cb(NULL, level, line);
+}
+
+int laser_parse_token(const char *str, int *token)
+{
+    /* strtol() alone would accept leading whitespace and a sign. */
+    if (str == NULL || *str < '0' || *str > '9')
+        return 0;
+
+    char *end;
+    errno = 0;
+    long value = strtol(str, &end, 10);
+
+    /* ERANGE is not redundant with the bound beside it: where long is 32 bits
+     * an overflowing value saturates to LONG_MAX, which is INT_MAX. */
+    if (*end != '\0' || errno == ERANGE || value > INT_MAX)
+        return 0;
+
+    *token = (int)value;
+    return 1;
 }
 
 static laser_entry_t g_entries[LASER_MAX_DEVICES];

@@ -272,6 +272,17 @@ typedef enum {
  * ============================================================================ */
 
 /**
+ * Parse the decimal text form of a token, as it travels inside an MRL or a
+ * device name: one or more ASCII digits and nothing else, no sign, no
+ * whitespace, no trailing characters, and a value that fits in an int.
+ *
+ * @param str   the text to parse; NULL is rejected.
+ * @param token receives the value on success, untouched otherwise.
+ * @return 1 if @p str is a token, 0 otherwise.
+ */
+int laser_parse_token(const char *str, int *token);
+
+/**
  * Declare that this consumer holds @p token, registering the device if this
  * is the first claim on it. Paired with laser_release().
  *
