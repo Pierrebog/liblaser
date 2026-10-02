@@ -348,8 +348,9 @@ int laser_probe_lun(laser_entry_t *entry);
  * further command; clearing a stalled endpoint is not enough. */
 #define USB_BOT_STATUS_PHASE_ERROR 0x02
 
-/** The CBW could not be handed over: the drive never saw the command, and
- * replaying it is always safe. */
+/** The command was never executed: its CBW did not go out, or went out
+ * incomplete or was stalled - in which case the Reset Recovery BBB requires
+ * has been performed. Replaying it is always safe. */
 #define BOT_FAIL_NOT_SENT    (-2)
 
 /** The transaction ended in a state requiring a Reset Recovery, which
@@ -370,7 +371,7 @@ int laser_probe_lun(laser_entry_t *entry);
  * idempotency are scsi.c's, decided on this return value:
  *
  *   0                     the command completed and the CSW says PASS
- *   BOT_FAIL_NOT_SENT     the drive never received it; replay is free
+ *   BOT_FAIL_NOT_SENT     the drive never executed it; replay is free
  *   BOT_FAIL_PHASE_ERROR  host and device disagreed; recovery already done
  *   BOT_FAIL_NO_DEVICE    the device is gone; no budget can help
  *   -1                    anything else: the CBW went out, so the drive HAS

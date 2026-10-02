@@ -4,7 +4,7 @@
  * Copyright (C) 2026 Authors
  *
  * Authors: Pierre Bogdanovscky
- * Co-authored-by: claude-code:claude-opus-5-0
+ * Co-authored-by: claude-code:claude-opus-5-5
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -22,13 +22,11 @@
  *****************************************************************************
  * CBW framing, the data phase in either direction, the CSW and its
  * validation, stall recovery and Reset Recovery - USB Mass Storage Class
- * Bulk-Only Transport, rev 1.0, and nothing above it.
+ * Bulk-Only Transport rev 1.0 ("BBB" below), and nothing above it.
  *
- * WHAT IS NOT HERE, and the line the split follows: this file has no retry
- * policy, no sense-code interpretation and no idea what any CDB means. It
- * performs exactly one transaction and reports, through its return value,
- * enough for scsi.c to decide whether that transaction may be replayed.
- * Everything that needs to know what a command IS lives there.
+ * No retry policy, no sense codes, no idea what a CDB means: this performs
+ * one transaction and reports, through its return value, enough for scsi.c
+ * to decide whether it may be replayed.
  *****************************************************************************/
 
 #include <string.h>
@@ -46,37 +44,17 @@
 #define USB_BOT_CBW_SIZE        31
 #define USB_BOT_CSW_SIZE        13
 
-/* USB_BOT_STATUS_PASS/FAIL/PHASE_ERROR are in laser_internal.h: they are the
- * value space of laser_bot_send_locked()'s csw_status out-parameter, which
- * scsi.c reads. */
-
-/* The Bulk-Only Mass Storage Reset class request is issued by
- * laser_mass_storage_reset() in usb.c, and its two constants live there with
- * it - as GET MAX LUN's do in scsi.c beside the only call that sends it. Each
- * class request sits with the function that issues it; what stays here is the
- * wire format of a transaction, which is this file's subject. */
-
-/* The CBW and CSW below are built by assigning their multi-byte fields
- * directly and then handing the struct to libusb as a byte string. BOT
- * defines those fields as little-endian, so that shortcut is only correct
- * on a little-endian host.
- *
- * Every Android ABI in use is little-endian, so this holds today and the
- * shortcut is worth keeping - byte-swapping helpers on every field would
- * be noise around an invariant that has never been false here. What is
- * not acceptable is for it to become silently wrong if that ever changes,
- * hence the check rather than a comment alone. */
+/* The CBW and CSW are serialized by struct layout, their multi-byte fields
+ * assigned directly. BBB defines those fields as little-endian, which every
+ * Android ABI is - so the shortcut stays, and a host where it would be wrong
+ * fails to build instead of sending garbage. A toolchain that cannot say
+ * fails too: add byte swapping, or define the macros for a target known to
+ * be little-endian. */
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
 # if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #  error "laser: CBW/CSW are serialized by struct layout, which assumes a little-endian host"
 # endif
 #else
-/* No way to ask. The previous form was "check if the compiler tells us",
- * which silently passed on any toolchain that does not define these - the
- * one case where the assumption most needs testing, since it is also the
- * case where nobody has thought about this port. Failing to build is the
- * correct outcome: whoever hits it either adds the byte-swapping or confirms
- * the target is little-endian and defines the macros. */
 # error "laser: cannot determine host byte order; see the comment above"
 #endif
 
@@ -99,49 +77,30 @@ typedef struct {
 } bot_csw_t;
 #pragma pack(pop)
 
-/* The wire sizes BBB fixes, and the whole reason for the pragma above.
- *
- * Both structures are handed to libusb as byte strings of USB_BOT_*_SIZE
- * bytes, so a packing directive that failed to apply - a toolchain that
- * ignores it, a header interposed between the push and the pop - would not
- * fail to build. It would send 32- or 40-byte CBWs that the drive rejects,
- * and read CSWs out of alignment with the fields they are copied into. The
- * symptom is a drive that refuses everything, a long way from the cause. */
+/* A packing directive that failed to apply would not fail to build: it would
+ * send CBWs the drive rejects, a long way from the cause. */
 _Static_assert(sizeof(bot_cbw_t) == USB_BOT_CBW_SIZE,
                "bot_cbw_t is not 31 bytes: #pragma pack did not apply");
 _Static_assert(sizeof(bot_csw_t) == USB_BOT_CSW_SIZE,
                "bot_csw_t is not 13 bytes: #pragma pack did not apply");
-/* Per-phase USB timeouts, in milliseconds.
- *
- * The data phase gets much longer than the wrapper phases because it is
- * the only one whose duration depends on the disc: a drive hitting a
- * damaged sector retries internally before answering, and a full
- * LASER_MAX_BYTES_PER_TRANSFER read from slow media is already
- * hundreds of milliseconds when everything goes well. The CBW and CSW
- * are 31 and 13 bytes of pure protocol overhead - if those do not come
- * back promptly, waiting longer will not help. */
+
+/* Per-phase USB timeouts, in milliseconds. The data phase gets the longest:
+ * it alone depends on the disc - a damaged sector is retried inside the drive
+ * before it answers - while the CBW and CSW are a few bytes of protocol that
+ * waiting longer will not bring. */
 #define CBW_PHASE_TIMEOUT_MS    3000
 #define DATA_PHASE_TIMEOUT_MS   5000
 #define CSW_PHASE_TIMEOUT_MS    3000
 
-/* Timeouts for PROBES - commands that need no medium and that a working
- * device answers immediately: INQUIRY, and anything else asked only to find
- * out what we are talking to.
+/* Timeouts for PROBES - commands a working device answers at once, with or
+ * without a medium (INQUIRY). Under the read timeouts, a device answering
+ * nothing cost seconds per attempt to establish so, on every browse.
  *
- * The values above are sized for reads: a drive that has to seek, or that is
- * still spinning up, legitimately takes seconds, and cutting them short would
- * turn a slow read into a failed one. A probe has no such excuse. Letting it
- * inherit those values means a device that answers nothing costs five seconds
- * to establish it - measured on a card reader behind a misbehaving armv7 host
- * controller, where three INQUIRY attempts came to thirteen seconds on the
- * browse path.
- *
- * Set entry->probe_timeouts around such a command; laser_bot_send_locked()
- * reads it. Guarded by io_lock like everything else in that function, so the
- * bracket cannot overlap another consumer's command. */
+ * Used while entry->probe_timeouts is set, under io_lock. */
 #define PROBE_CBW_PHASE_TIMEOUT_MS    500
 #define PROBE_DATA_PHASE_TIMEOUT_MS   700
 #define PROBE_CSW_PHASE_TIMEOUT_MS    500
+
 static void bot_clear_stall(laser_entry_t *entry, unsigned char endpoint)
 {
     int ret = libusb_clear_halt(entry->handle, endpoint);
@@ -154,10 +113,9 @@ static void bot_clear_stall(laser_entry_t *entry, unsigned char endpoint)
 /* ============================================================================
  * One BOT transaction: CBW, data phase (either direction), CSW.
  *
- * The CONTRACT - what each return code means and what the caller may do
- * about it - lives with the declaration in laser_internal.h, because that
- * is what scsi.c reads. What follows is why each wire condition maps to the
- * code it does, which is only useful next to the code that decides it.
+ * The contract - what each return code means - is with the declaration in
+ * laser_internal.h. What follows is why each wire condition maps to the code
+ * it does.
  * ============================================================================ */
 
 int laser_bot_send_locked(laser_entry_t *entry,
@@ -169,9 +127,8 @@ int laser_bot_send_locked(laser_entry_t *entry,
     bot_csw_t csw;
     unsigned char csw_buf[USB_BOT_CSW_SIZE];
     int transferred = 0;
-    /* Bytes libusb actually moved during the data phase. Kept separately
-     * because `transferred` is reused by the CSW read below, and because
-     * it is needed after that read as a sanity bound on the residue. */
+    /* Bytes the data phase moved, kept apart from `transferred`, which the
+     * CSW read reuses, to bound the residue afterwards. */
     int data_transferred = 0;
     int ret;
 
@@ -179,12 +136,9 @@ int laser_bot_send_locked(laser_entry_t *entry,
         *csw_status = -1;
     }
 
-    /* Last line of defence on the CBW's fixed 16-byte command field.
-     * laser_scsi_cdb() rejects an out-of-range cdb_len before it can
-     * reach here, so this is unreachable from outside - but the memcpy
-     * below is the actual overflow site, of a stack struct, and it is
-     * worth one comparison to make that impossible independently of what
-     * any caller does or any future entry point forgets to check. */
+    /* laser_scsi_cdb() already rejects this, but the memcpy below is the
+     * overflow site, of a stack struct, and one comparison makes it
+     * impossible whatever a caller does. */
     if (cdb_len < 0 || cdb_len > (int)sizeof(cbw.CBWCB)) {
         LOGE("token=%d: refusing a %d-byte CDB (max %zu)",
              entry->token, cdb_len, sizeof(cbw.CBWCB));
@@ -209,12 +163,32 @@ int laser_bot_send_locked(laser_entry_t *entry,
         LOGW("token=%d: device gone while sending the CBW", entry->token);
         return BOT_FAIL_NO_DEVICE;
     }
-    if (ret != LIBUSB_SUCCESS || transferred != USB_BOT_CBW_SIZE) {
+    if (transferred == USB_BOT_CBW_SIZE &&
+        (ret == LIBUSB_SUCCESS || ret == LIBUSB_ERROR_TIMEOUT)) {
+        /* The whole CBW went out, even if the clock ran out on the way: the
+         * drive has the command, and treating it as unsent would let scsi.c
+         * replay a command that may have been executed. */
+        if (ret != LIBUSB_SUCCESS) {
+            LOGW("token=%d: CBW phase timed out after the whole CBW went out, "
+                 "carrying on", entry->token);
+        }
+    } else if (transferred == 0 && ret != LIBUSB_ERROR_PIPE) {
+        /* Nothing went out: the drive never saw the command, and its state
+         * is untouched. The only failure after which replaying a command
+         * that changes CSS state is provably harmless. */
         LOGW("token=%d: CBW send failed: %s", entry->token,
              libusb_error_name(ret));
-        /* The command never reached the drive - distinct from every
-         * other failure below, and the only case where replaying a
-         * non-idempotent command (SEND KEY) is provably harmless. */
+        return BOT_FAIL_NOT_SENT;
+    } else {
+        /* Part of a CBW, or a stalled Bulk-Out: the device holds an invalid
+         * CBW, which it will not execute, and BBB 6.6.1 requires a Reset
+         * Recovery before it accepts the next one. Returning without it left
+         * the device waiting for the rest of the 31 bytes, to take the start
+         * of the next command for them. */
+        LOG_QUIRK(entry, "CBW not accepted (%s, %d/%d bytes): performing "
+                         "Reset Recovery",
+                  libusb_error_name(ret), transferred, USB_BOT_CBW_SIZE);
+        laser_mass_storage_reset(entry);
         return BOT_FAIL_NOT_SENT;
     }
 
@@ -226,26 +200,12 @@ int laser_bot_send_locked(laser_entry_t *entry,
                                    entry->probe_timeouts ? PROBE_DATA_PHASE_TIMEOUT_MS
                                                          : DATA_PHASE_TIMEOUT_MS);
         if (ret == LIBUSB_ERROR_PIPE) {
-            /* A stalled data endpoint is not an aborted command. BBB
-             * 6.7.2/6.7.3: this is how a device declines a data phase, or
-             * ends one early, when it has less to say than the CBW asked
-             * for - and it has ALREADY queued its CSW on the Bulk-In
-             * pipe, waiting for the host to collect it. The prescribed
-             * recovery is to clear the halt and read that status.
-             *
-             * Returning here instead left those 13 bytes in the pipe. The
-             * next command's data phase then consumed them, so the pipe
-             * stayed offset by one and every command after it read the
-             * previous command's CSW - the same cascade, from the same
-             * cause, that the partial-timeout branch below exists to
-             * prevent.
-             *
-             * Collecting the CSW is also what makes the failure
-             * diagnosable rather than merely fatal: it carries
-             * bCSWStatus=FAIL, which is what lets the retry loop send
-             * REQUEST SENSE and discover that the disc is, say, simply
-             * gone. Giving up here turned every stalled read into a bare
-             * I/O error, retried six times over for nothing. */
+            /* A stalled data endpoint is how a device ends a data phase early
+             * (BBB 6.7.2/6.7.3), with its CSW already queued on the Bulk-In
+             * pipe. Clear the halt and read that CSW: left in the pipe, it
+             * would be read as the next command's data, offsetting every
+             * command after it. Its FAIL status is also what lets scsi.c ask
+             * REQUEST SENSE why. */
             LOGW("token=%d: data phase stalled after %d/%d bytes, clearing "
                  "halt and collecting the CSW",
                  entry->token, transferred, data_len);
@@ -253,38 +213,17 @@ int laser_bot_send_locked(laser_entry_t *entry,
             /* Falls through to the CSW read, with `transferred` holding
              * whatever libusb moved before the halt. */
         } else if (ret == LIBUSB_ERROR_TIMEOUT) {
-            /* A timeout does NOT mean nothing was transferred: libusb
-             * splits large transfers into chunks to satisfy OS limits,
-             * so the deadline can expire after some of them completed,
-             * and libusb keeps whatever did get through. `transferred`
-             * is therefore meaningful here and decides which of two very
-             * different situations this is.
-             *
-             * Everything arrived: the device finished its data phase and
-             * the clock simply ran out on the way. Its CSW is waiting on
-             * the Bulk-In pipe, so carrying on to read it is correct -
-             * this is the case the previous blanket tolerance was aimed
-             * at, and it stays tolerated. */
+            /* libusb splits large transfers, so a timeout may come after some
+             * or all of the data arrived, and `transferred` says which. */
             if (transferred == data_len) {
+                /* The device finished; its CSW is waiting. */
                 LOGW("token=%d: data phase timed out but completed (%d bytes), "
                      "continuing to CSW", entry->token, transferred);
             } else {
-                /* Short: the device is still mid-data-phase. Reading the
-                 * CSW now would read from a pipe that still holds data,
-                 * and those 13 bytes would be data masquerading as a
-                 * CSW. The signature/tag checks reject them, but the
-                 * damage outlives this command: the pipe stays offset by
-                 * one, so the NEXT command reads THIS command's real
-                 * CSW, and every command after it inherits the shift.
-                 * That shows up as a run of unexplained failures whose
-                 * cause is nowhere near where they appear.
-                 *
-                 * BBB has no "carry on anyway" branch for a host and
-                 * device that disagree about the data phase: recover via
-                 * the CSW if the device is genuinely finished, otherwise
-                 * Reset Recovery. It isn't finished, so reset - which
-                 * also re-syncs the pipes, making the next command clean
-                 * rather than the first of a cascade. */
+                /* The device is still mid-data-phase: a CSW read now would
+                 * take data for a CSW and offset the pipe by one for every
+                 * command after it. Host and device disagree about the data
+                 * phase, which only a Reset Recovery resolves. */
                 LOG_QUIRK(entry, "data phase timed out after %d/%d bytes: "
                                  "device still mid-transfer, performing Reset Recovery",
                           transferred, data_len);
@@ -295,9 +234,16 @@ int laser_bot_send_locked(laser_entry_t *entry,
             LOGW("token=%d: device gone during the data phase", entry->token);
             return BOT_FAIL_NO_DEVICE;
         } else if (ret != LIBUSB_SUCCESS) {
-            LOGW("token=%d: data phase failed: %s", entry->token,
-                 libusb_error_name(ret));
-            return -1;
+            /* Any other failure - an I/O error, an overflow from a device
+             * sending more than asked - leaves the pipes in an unknown state,
+             * with the CSW possibly still queued. Without a Reset Recovery
+             * here, the next command would read that stale CSW, fail its tag
+             * check and reset then, one command too late. */
+            LOG_QUIRK(entry, "data phase failed after %d/%d bytes (%s): "
+                             "performing Reset Recovery",
+                      transferred, data_len, libusb_error_name(ret));
+            laser_mass_storage_reset(entry);
+            return BOT_FAIL_PHASE_ERROR;
         }
         if (actual_len) {
             *actual_len = transferred;
@@ -312,13 +258,9 @@ int laser_bot_send_locked(laser_entry_t *entry,
                                entry->probe_timeouts ? PROBE_CSW_PHASE_TIMEOUT_MS
                                                      : CSW_PHASE_TIMEOUT_MS);
     if (ret == LIBUSB_ERROR_PIPE) {
-        /* BBB 6.7.3 gives a stalled status phase exactly one more chance:
-         * clear the halt and read the CSW again. Only if that second
-         * attempt also fails is Reset Recovery called for.
-         *
-         * Giving up after the first stall spent an attempt from the retry
-         * budget - and, for a DATA-OUT command, the whole command - on a
-         * device that was one clear_halt away from answering normally. */
+        /* BBB 6.7.3 gives a stalled status phase one more chance: clear the
+         * halt and read the CSW again. Only a second failure calls for a
+         * Reset Recovery. */
         LOGW("token=%d: CSW phase stalled, clearing halt and retrying once",
              entry->token);
         bot_clear_stall(entry, entry->ep_in);
@@ -328,19 +270,17 @@ int laser_bot_send_locked(laser_entry_t *entry,
                                                      : CSW_PHASE_TIMEOUT_MS);
     }
     if (ret == LIBUSB_ERROR_NO_DEVICE) {
-        /* Checked before the Reset Recovery below: that reset is a control
-         * transfer plus a 100ms settle sleep, all of it addressed to
-         * something that is no longer on the bus. */
+        /* Before the Reset Recovery below, which would address a device that
+         * is no longer on the bus. */
         LOGW("token=%d: device gone while reading the CSW", entry->token);
         return BOT_FAIL_NO_DEVICE;
     }
-    if (ret != LIBUSB_SUCCESS || transferred != USB_BOT_CSW_SIZE) {
-        /* No valid status for a command the drive has certainly seen.
-         * Host and device now disagree about where this transaction
-         * ended, which is exactly the condition Reset Recovery exists for
-         * (BBB 6.6.1): returning a plain error would leave whatever the
-         * device still has queued sitting in the pipe, to be misread as
-         * the next command's data or status. */
+    if (transferred != USB_BOT_CSW_SIZE ||
+        (ret != LIBUSB_SUCCESS && ret != LIBUSB_ERROR_TIMEOUT)) {
+        /* No valid status for a command the drive has certainly seen: host
+         * and device disagree about where the transaction ended, which is
+         * what Reset Recovery is for (BBB 6.6.1). A timeout after all 13
+         * bytes arrived is not that, and the CSW is used. */
         LOG_QUIRK(entry, "no valid CSW after retry (%s, %d/%d bytes): "
                          "performing Reset Recovery",
                   libusb_error_name(ret), transferred, USB_BOT_CSW_SIZE);
@@ -351,13 +291,9 @@ int laser_bot_send_locked(laser_entry_t *entry,
     memcpy(&csw, csw_buf, USB_BOT_CSW_SIZE);
 
     if (csw.dCSWSignature != USB_BOT_CSW_SIGNATURE || csw.dCSWTag != cbw.dCBWTag) {
-        /* BBB 6.6.1: a CSW that fails the signature or tag check is not
-         * valid, and the host shall perform a Reset Recovery. Detecting
-         * the desynchronisation without repairing it would be the worst
-         * of both worlds - a tag mismatch means these 13 bytes are most
-         * likely a PREVIOUS command's status, so there is at least one
-         * more CSW queued behind them and the offset survives into the
-         * next command. Only the reset flushes the pipes. */
+        /* BBB 6.6.1: an invalid CSW calls for a Reset Recovery. A tag
+         * mismatch most likely means a previous command's CSW, with more
+         * queued behind it; only the reset flushes the pipes. */
         LOG_QUIRK(entry, "CSW signature/tag mismatch (sig %08x tag %u, "
                          "expected %08x/%u): performing Reset Recovery",
                   csw.dCSWSignature, csw.dCSWTag,
@@ -371,86 +307,42 @@ int laser_bot_send_locked(laser_entry_t *entry,
     }
 
     if (csw.bCSWStatus == USB_BOT_STATUS_PHASE_ERROR) {
-        /* BBB 6.6.3/6.7: Phase Error means the device's own state
-         * machine is out of sync with ours, and the host "shall perform
-         * a Reset Recovery". Until that happens the device is entitled
-         * to fail or stall everything we send it, so simply returning an
-         * error here - and letting the retry loop fire five more
-         * commands at it - would burn the whole attempt budget on a
-         * device that cannot answer any of them, and leave it wedged for
-         * the rest of the session afterwards.
-         *
-         * The reset is done here rather than by the caller because this
-         * is the only place that knows a Phase Error happened at all,
-         * and because it must happen before ANY further command on this
-         * device, including the REQUEST SENSE the retry loop would
-         * otherwise send next (which is itself just another command the
-         * device would reject). */
+        /* BBB 6.6.3/6.7: the host shall perform a Reset Recovery, before any
+         * other command - REQUEST SENSE included, which the device would be
+         * entitled to reject like the rest. Done here, the only place that
+         * knows a Phase Error happened. */
         LOG_QUIRK(entry, "Phase Error (CSW 02h): performing Reset Recovery");
         laser_mass_storage_reset(entry);
         return BOT_FAIL_PHASE_ERROR;
     }
 
-    /* BBB 6.3: a CSW is "meaningful" only when, for status 00h/01h, the
-     * residue does not exceed what we asked for. (For 02h it is to be
-     * ignored entirely - handled above, before this point.) A residue
-     * larger than dCBWDataTransferLength means the device is telling us
-     * it left MORE bytes untransferred than we ever requested, which is
-     * self-contradictory: the CSW cannot be trusted at all, so treat it
-     * like any other unusable status rather than deriving a length from
-     * it. 6.5 permits a Reset Recovery here; we return an error and let
-     * the retry loop decide, which is the lighter of the two responses
-     * and adequate since the device is not necessarily desynchronised. */
+    /* BBB 6.3: for status 00h/01h, a CSW is meaningful only if its residue
+     * does not exceed the requested length. One that does contradicts itself
+     * and cannot be trusted. A plain error is the lighter response the
+     * specification allows, the device not necessarily being out of sync. */
     if (csw.dCSWDataResidue > (uint32_t)data_len) {
         LOG_QUIRK(entry, "CSW not meaningful: residue %u > requested %d",
                   csw.dCSWDataResidue, data_len);
         return -1;
     }
 
-    /* How many bytes of the data phase actually count?
+    /* How many bytes of the data phase count? The wire count and the residue
+     * do not always agree, and which one is wrong depends on the hardware: a
+     * conforming device may pad a short transfer to full length (BBB cases
+     * 4/5), making the residue right; several USB-SATA bridges in optical
+     * enclosures report a residue that is simply wrong - Linux carries
+     * US_FL_IGNORE_RESIDUE for them, the INIC-3619 among others - making the
+     * wire count right. So the residue is used only where it cannot make
+     * things worse:
      *
-     * Two independent measurements are available and they do not always
-     * agree: `data_transferred` is what libusb saw arrive on the wire,
-     * and dCSWDataResidue is the device's own statement of what it left
-     * untransferred, which BBB defines as dCBWDataTransferLength minus
-     * the amount it really processed.
-     *
-     * Where they disagree, which one is wrong depends on the hardware,
-     * and that is not knowable from here:
-     *
-     *   - A conforming device that sends less than requested may pad the
-     *     transfer up to the full length (BBB cases 4/5). Then the wire
-     *     count is inflated by fill bytes and the residue is right.
-     *   - Several USB-SATA bridges used in optical-drive enclosures
-     *     report a residue that is simply wrong; Linux carries an
-     *     explicit US_FL_IGNORE_RESIDUE quirk for them, including for at
-     *     least one bridge (INIC-3619) found in slimline optical drive
-     *     enclosures - exactly the hardware this code targets. There the
-     *     wire count is right and the residue is garbage.
-     *
-     * So the residue is used only where it cannot make things worse:
-     *
-     *   residue == 0            Nothing withheld. Both agree, and this
-     *                           is the overwhelmingly common case.
-     *   transferred < data_len  The device demonstrably sent short, so
-     *                           there is no padding to see through. Take
-     *                           the smaller of the two: never report
-     *                           more bytes than actually arrived, since
-     *                           the caller's buffer is uninitialised
-     *                           beyond that point.
-     *   transferred == data_len Ambiguous: either padding (residue
-     *     and residue > 0       right) or a broken bridge (residue
-     *                           wrong). Believing the residue here
-     *                           truncates every read on such a bridge -
-     *                           and this is the hot path, running
-     *                           thousands of times per playback - so
-     *                           keep the wire count, which is what this
-     *                           transport did before the residue was
-     *                           consulted at all, and log it. The log is
-     *                           the point: it is the signal that would
-     *                           justify a per-device quirk later, and
-     *                           without it such a device is
-     *                           indistinguishable from a healthy one. */
+     *   residue == 0            both agree: the common case.
+     *   transferred < data_len  the device sent short, so there is no padding
+     *                           to see through: the smaller of the two, never
+     *                           more than actually arrived.
+     *   transferred == data_len ambiguous. Believing the residue would
+     *     and residue > 0       truncate every read on such a bridge, so the
+     *                           wire count is kept, and the contradiction
+     *                           logged once per device. */
     if (data_len > 0 && data && actual_len) {
         int by_residue = data_len - (int)csw.dCSWDataResidue;
 
