@@ -114,8 +114,9 @@ typedef struct {
  * though its UDF Bridge also carries ISO9660. VLC's vcd module reads a Video
  * CD through ISO9660, the only filesystem it has.
  *
- * The ISO9660 walk is addressed from the start of the first data track, taken
- * from the TOC. A filesystem in a later session of a multi-session disc is
+ * The ISO9660 walk looks for the Primary Volume Descriptor at sector 16 of the
+ * first data track, taken from the TOC; the extents it holds are absolute, as
+ * multi-session mastering writes them. A filesystem in a later session is
  * not found - locating that session needs READ TOC format 01h - so such a
  * disc yields LASER_DISC_UNKNOWN rather than a wrong answer.
  *

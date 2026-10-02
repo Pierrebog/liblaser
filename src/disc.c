@@ -224,8 +224,10 @@ static udf_disc_t detect_udf_disc(int token, char *volume_id)
  * or /SVCD - so this walks exactly that: no Joliet, no Rock Ridge, no path
  * table, no recursion.
  *
- * Addresses are relative to the start of the first data track, which is
- * where ISO9660 places its volume descriptors (see iso_ctx_t).
+ * The volume descriptors start at sector 16 of the track carrying the
+ * filesystem; the extents they lead to are absolute LBAs on the disc. That
+ * is how multi-session mastering tools write them and how Linux's isofs
+ * reads them, so the track's start offsets the PVD alone.
  * ============================================================================ */
 
 #define ISO_SECTOR_SIZE 2048
@@ -247,8 +249,8 @@ static udf_disc_t detect_udf_disc(int token, char *volume_id)
 #define ISO_FLAG_DIRECTORY  0x02
 
 /** The token to read through, and the start LBA of the track carrying the
- * filesystem, which every address of the walk is relative to. It comes from
- * the TOC read_cd_toc() already fetched, at no extra command. */
+ * filesystem, where its PVD is found - from the TOC read_cd_toc() already
+ * fetched, at no extra command. Extents are absolute and not offset by it. */
 typedef struct {
     int      token;
     uint32_t base;
@@ -266,7 +268,7 @@ static uint32_t iso_le32(const uint8_t *p)
  * stops and reports nothing. */
 static bool iso_read_sector(const iso_ctx_t *ctx, uint32_t lba, uint8_t *buf)
 {
-    return laser_read_blocks(ctx->token, ctx->base + lba, 1, buf) == 1;
+    return laser_read_blocks(ctx->token, lba, 1, buf) == 1;
 }
 
 /** Compare a directory record's name against a plain ASCII one, ignoring
@@ -399,7 +401,7 @@ static bool iso_volume_id_is_printable_ascii(const uint8_t *p, unsigned len)
 static iso_video_t detect_iso_video(const iso_ctx_t *ctx, char *volume_id)
 {
     uint8_t pvd[ISO_SECTOR_SIZE];
-    if (!iso_read_sector(ctx, ISO_PVD_LBA, pvd))
+    if (!iso_read_sector(ctx, ctx->base + ISO_PVD_LBA, pvd))
         return ISO_VIDEO_NONE;
 
     /* Type 1, the Primary Volume Descriptor, and the "CD001" identifier:
@@ -542,7 +544,7 @@ typedef enum {
  * read_medium() for what a drive answers on anything else.
  *
  * @param first_data_lba receives the start LBA of the first DATA track, or 0
- *        if there is none - the base of the ISO9660 walk.
+ *        if there is none - where the ISO9660 walk looks for the PVD.
  */
 static cd_toc_t read_cd_toc(int token, uint32_t *first_data_lba)
 {
