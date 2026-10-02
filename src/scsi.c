@@ -4,7 +4,7 @@
  * Copyright (C) 2026 Authors
  *
  * Authors: Pierre Bogdanovscky
- * Co-authored-by: claude-code:claude-opus-5-0
+ * Co-authored-by: claude-code:claude-opus-5-5
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -21,15 +21,14 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************
  * Everything that needs to know what a command MEANS: sense-code
- * classification, the retry policy keyed on what the command actually is,
- * the probes that run once at registration (INQUIRY, GET MAX LUN, TEST UNIT
- * READY), and the LBA-aware chunked read helpers.
+ * classification, the retry policy, the probes run once at registration
+ * (INQUIRY, GET MAX LUN, TEST UNIT READY), the DVD region check and the
+ * chunked block reads.
  *
- * Every transaction it issues goes through laser_bot_send_locked() in bot.c,
- * which knows the wire format and nothing else. The resilience this file
- * adds is centralized here so that none of this project's ~15 patched call
- * sites (libdvdcss's ioctl.c, VLC's cdda/vcd modules through cdrom.c, the
- * laser access module) needs to know about it.
+ * Every transaction goes through laser_bot_send_locked() in bot.c, which
+ * knows the wire format and nothing else. Keeping the resilience here spares
+ * each consumer - libdvdcss, VLC's cdrom.c, the laser access module - from
+ * reimplementing it.
  *****************************************************************************/
 
 #include <string.h>
@@ -39,65 +38,41 @@
 #include "laser.h"
 #include "laser_internal.h"
 
-/* Fixed-format sense data (SCSI SPC): byte 2 low nibble is the sense key,
- * byte 12 is the Additional Sense Code (ASC), byte 13 is the Additional
- * Sense Code Qualifier (ASCQ). Values below checked against T10's
- * published ASC/ASCQ assignment list (t10.org/lists/asc-num.txt).
+/* Fixed-format sense data (SPC): sense key in the low nibble of byte 2,
+ * Additional Sense Code (ASC) in byte 12, its qualifier (ASCQ) in byte 13.
+ * Values checked against T10's assignment list (t10.org/lists/asc-num.txt).
  *
- * Note on ASC-only vs ASC+ASCQ matching: an ASC groups related
- * conditions and its ASCQ distinguishes them, so whether the qualifier
- * has to be checked depends on whether every ASCQ under that ASC means
- * the same thing to us:
- *
- *   3Ah (MEDIUM NOT PRESENT): 3Ah/00h through 3Ah/04h are all "there is
- *        no disc" (tray closed, tray open, loadable...). They differ in
- *        detail we have no use for, so matching on the ASC alone is
- *        correct and deliberate.
- *
- *   28h: NOT the same story. 28h/00h is the medium-changed condition we
- *        want, but 28h/02h is FORMAT-LAYER MAY HAVE CHANGED, a C/DVD
- *        specific code a drive reports when crossing between layers of a
- *        dual-layer disc - an ordinary event in the middle of playing a
- *        DVD-9, not an ejection. It must be matched on ASC+ASCQ. */
+ * Whether the ASCQ must be matched depends on the ASC: every 3Ah qualifier
+ * means "no medium" to an ordinary command, while under 28h only 00h means a
+ * changed medium - 02h is a dual-layer DVD crossing layers mid-playback. */
 #define SCSI_SENSE_KEY_NOT_READY        0x02
 #define SCSI_SENSE_KEY_UNIT_ATTENTION   0x06
 
-/* Sense keys that a retry can never turn into a success. ILLEGAL REQUEST
- * means the drive understood the command and refuses it as issued - a
- * malformed CDB, an LBA past the end of the medium, or a read it will
- * not serve in its current state, such as a CSS-scrambled sector before
- * authentication. DATA PROTECT is the same answer for a different
- * reason. Neither becomes true by waiting. */
+/* Sense keys that no retry can turn into a success: the drive understood
+ * the command and refuses it as issued - a malformed CDB, an LBA past the
+ * end, a scrambled sector before authentication. */
 #define SCSI_SENSE_KEY_ILLEGAL_REQUEST  0x05
+#define SCSI_SENSE_KEY_DATA_PROTECT     0x07
 
-/* Under ILLEGAL REQUEST, the two that say WHY a command was refused rather
- * than merely that it was. Read after a failed START STOP UNIT, where they
- * separate "this bridge has no such opcode" from "it has it, but not in the
- * shape I sent" - two conclusions with opposite next steps. */
+/* Under ILLEGAL REQUEST, read after a refused START STOP UNIT: "no such
+ * opcode" and "not in this shape" call for opposite next steps. */
 #define SCSI_ASC_INVALID_OPCODE         0x20
 #define SCSI_ASC_INVALID_CDB_FIELD      0x24
-#define SCSI_SENSE_KEY_DATA_PROTECT     0x07
-/* 6Fh COPY PROTECTION KEY EXCHANGE FAILURE and neighbours - six distinct
- * conditions under one ASC, with three genuinely different remedies. They
- * all arrive with sense key 05h ILLEGAL REQUEST, so without the qualifier
- * they are indistinguishable from each other and from an ordinary refusal.
+
+/* 6Fh COPY PROTECTION KEY EXCHANGE FAILURE and neighbours, all under ILLEGAL
+ * REQUEST, with three different remedies:
  *
  *   6Fh/00h AUTHENTICATION FAILURE
  *   6Fh/01h KEY NOT PRESENT
- *   6Fh/02h KEY NOT ESTABLISHED   -> re-authenticate; the sector is NOT
- *                                    permanently unreadable, and treating it
- *                                    as such poisons content that a fresh
- *                                    handshake would hand over.
+ *   6Fh/02h KEY NOT ESTABLISHED   -> re-authenticate; the sector is not
+ *                                    permanently unreadable.
  *   6Fh/03h READ OF SCRAMBLED SECTOR WITHOUT AUTHENTICATION
- *                                 -> genuinely unreadable as things stand.
+ *                                 -> unreadable as things stand.
  *   6Fh/04h MEDIA REGION CODE IS MISMATCHED TO LOGICAL UNIT REGION
  *   6Fh/05h DRIVE REGION MUST BE PERMANENT/REGION RESET COUNT ERROR
- *                                 -> nothing to do with authentication; the
- *                                    user must be told the truth, and the
- *                                    region must never be silently changed
- *                                    on their hardware.
- *
- * Checked against T10's published assignment list. */
+ *                                 -> not an authentication problem; the user
+ *                                    must be told, and the drive's region
+ *                                    never changed on their behalf. */
 #define SCSI_ASC_COPY_PROTECTION        0x6f
 #define SCSI_ASCQ_CP_AUTH_FAILURE       0x00
 #define SCSI_ASCQ_CP_KEY_NOT_PRESENT    0x01
@@ -106,24 +81,16 @@
 #define SCSI_ASCQ_CP_REGION_MISMATCH    0x04
 #define SCSI_ASCQ_CP_REGION_PERMANENT   0x05
 
-/* 04h/01h: the drive has a medium and is bringing it up to speed. Not a
- * branch in the wait - it is simply "not ready yet", handled by the generic
- * tail - but recorded, because a drive that leaves the bus having said this
- * was drawing spindle current when it went. */
+/* 04h: not ready, 04h/01h being "becoming ready". Not a branch of its own in
+ * the spin-up wait, only recorded: a drive that leaves the bus right after
+ * saying it was drawing spindle current. */
 #define SCSI_ASC_BECOMING_READY         0x04
 
 #define SCSI_ASC_MEDIUM_NOT_PRESENT     0x3a
-/* The qualifiers under 3Ah, which do NOT all mean the same thing and must not
- * be handled as though they did.
- *
- * 3Ah/02h says the tray is OPEN. That is a physical fact the drive can see,
- * no command changes it, and no amount of waiting will close it - the one
- * qualifier here that is safe to treat as final.
- *
- * 3Ah/00h and 3Ah/01h say only that the drive has no medium state. That is
- * what an idle, parked drive answers about a disc sitting in its own tray,
- * and it is what this bridge answers throughout registration - so reading
- * either as "there is no disc" rejects a perfectly good one. */
+/* The qualifiers under 3Ah, which the spin-up wait tells apart. 3Ah/02h, tray
+ * OPEN, is a physical fact no command or wait changes. 3Ah/00h and 3Ah/01h
+ * only say the drive has no medium state, which is also what a parked drive
+ * answers about a disc in its own closed tray. */
 #define SCSI_ASCQ_MEDIUM_NOT_PRESENT      0x00
 #define SCSI_ASCQ_TRAY_CLOSED             0x01
 #define SCSI_ASCQ_TRAY_OPEN               0x02
@@ -136,125 +103,70 @@
  * transient and retryable; explicitly NOT an ejection. */
 #define SCSI_ASCQ_FORMAT_LAYER_CHANGED    0x02
 
-/* Retry budget: matches the classification probe's already-validated
- * policy. A wider window (some SCSI-transport libraries for burning
- * software use ~30s) was considered and rejected as too slow for
- * interactive playback - see the project recap for the reasoning. */
+/* Per-command retry budget: about two and a half seconds of delays, short
+ * enough for interactive playback. */
 #define LASER_MAX_RETRIES       6
 #define LASER_RETRY_DELAY_MS    500
 
-/* Spin-up wait budget, separate from and much larger than the per-command
- * retry budget above. The retry budget covers transient conditions that
- * clear in milliseconds (UNIT ATTENTION) or a fraction of a second
- * (becoming-ready between two reads). Spinning up a cold optical disc
- * from a full stop is mechanical and slow - commonly a few seconds, up to
- * ten or more on a sluggish drive or a marginal disc - so the first
- * contact with the device waits far longer, but only once per session.
- * 30 x 500ms = 15s, which cleared spin-up on the POC's test hardware with
- * margin to spare. */
+/* Spin-up wait budget, far larger than the per-command one but spent once per
+ * registration: a cold disc takes seconds to spin up, sometimes more than
+ * ten. 30 x 500ms is 15 s while the drive keeps answering "not yet". */
 #define LASER_SPINUP_MAX_ATTEMPTS  30
 #define LASER_SPINUP_DELAY_MS      500
 
-/* Hard ceiling on the wall-clock time the spin-up wait may consume,
- * whatever the attempt counter says.
- *
- * The attempt budget alone bounds nothing in real time. Its arithmetic
- * assumes each attempt costs one 500ms sleep plus two near-instant
- * commands, which holds while the drive is answering: 20 attempts, about
- * ten seconds, comfortably more than a cold DVD needs. It stops holding
- * the moment the drive stops answering without disappearing - wedged
- * firmware, a hub dropping transfers, a bridge that ignores its Bulk-In.
- * Each attempt then costs a TEST UNIT READY and a REQUEST SENSE that
- * each run out CBW_PHASE_TIMEOUT_MS + CSW_PHASE_TIMEOUT_MS, and twenty of
- * those is measured in minutes.
- *
- * Minutes is not merely slow, it is a hang: this runs inside
- * laser_register(), which holds the registry lock
- * for its whole duration - so a teardown blocks behind
- * it, and the caller cannot cancel it either, since registration runs to
- * completion once started.
- *
- * 15s leaves clear headroom over the ~10s the nominal path spends, so
- * this never fires on a merely slow drive, while capping the pathological
- * one at something a user experiences as a pause rather than a freeze. */
+/* Hard ceiling on the real time the spin-up wait may take, whatever the
+ * attempt count. The attempt budget assumes near-instant answers; a drive
+ * that stops answering without leaving the bus makes each attempt cost two
+ * full sets of phase timeouts, turning thirty attempts into minutes - spent
+ * under the registry lock, blocking every teardown and registration. */
 #define LASER_SPINUP_MAX_WALL_MS   15000
 
-/* A SECOND, SHORTER wall-clock ceiling, used only while the drive is
- * answering MEDIUM NOT PRESENT with a tray-closed or generic qualifier.
- *
- * The 15s above is what a promise is worth. 02h/04h/01h - becoming ready -
- * is the drive saying it is working on it, and waiting is exactly the right
- * response to that. 3Ah/00h and 3Ah/01h promise nothing: they are the answer
- * of a drive that has no medium state, which is equally what an empty tray
- * and a parked drive with a disc in it produce. Spending the full budget on
- * that would make every browse with an empty drive block the registry lock
- * for fifteen seconds.
- *
- * So this path gets its own budget, starting when START STOP UNIT has been
- * sent (see spin_up_locked): long enough for a drive that was told to load
- * to get its medium detected, short enough that an empty tray costs a pause
- * rather than a freeze. Whichever ceiling is reached first ends the wait. */
+/* A shorter ceiling, for a drive answering 3Ah with a tray-closed or generic
+ * qualifier, counted from the START STOP UNIT. Unlike "becoming ready", that
+ * answer promises nothing - an empty tray gives it too - so it gets long
+ * enough for a drive told to load to find its medium, and short enough that
+ * an empty drive costs a pause rather than fifteen seconds. Whichever ceiling
+ * comes first ends the wait. */
 #define LASER_NO_MEDIUM_MAX_WALL_MS 4000
 
-/* LASER_MAX_BYTES_PER_TRANSFER and LASER_MIN_BYTES_PER_TRANSFER are in
- * laser_internal.h: they bound laser_entry_t::max_transfer_bytes, which
- * registry.c initialises, so they belong with that field.
- * GET MAX LUN: Bulk-Only class request, Device-to-Host, returns one byte
- * holding the number of the LAST logical unit (so 0 means "one LUN"). A
- * device that does not support multiple LUNs is required to stall it. */
+/* GET MAX LUN: Bulk-Only class request, Device-to-Host, returning one byte,
+ * the number of the LAST logical unit (0 means one unit). A device with a
+ * single unit may stall it. */
 #define USB_BOT_GETMAXLUN_bREQUEST      0xFE
 #define USB_BOT_GETMAXLUN_bmREQUESTTYPE 0xA1  /* Class | Interface | Dev-to-Host */
 
-/* Highest LUN we will probe even if the device claims more. The class
- * allows up to 15; nothing that pairs an optical drive with a card
- * reader uses anything like that many, and each extra unit costs an
- * INQUIRY at registration time. */
+/* Highest LUN probed, whatever the device claims: each unit costs an INQUIRY
+ * at registration, and combo enclosures use two at most. */
 #define LASER_MAX_LUN_PROBED 3
 
 /* SCSI INQUIRY (SPC), byte 0 low 5 bits: peripheral device type. */
-#define SCSI_PDT_DIRECT_ACCESS  0x00
-
-/* INQUIRY attempts before concluding the device will not answer it, and the
- * first of the delays between them.
- *
- * On a build whose kernel mounts optical media, plugging a drive in starts
- * usb-storage enumerating and mounting the disc. Classify during that window
- * and the interface is taken mid-command - the bridge says so in as many
- * words, "device still mid-transfer" - and the outstanding work belongs to a
- * driver that has just been detached and will never collect it. The device
- * needs time, not another command. Observed: three attempts spanning ~2.4s
- * all failed, while a later registration got its answer on attempt 3.
- *
- * So: more attempts, and a delay that doubles - 100, 200, 400, 800, 1600,
- * 3200ms - giving about six seconds of settling across seven attempts. A
- * healthy device answers on the first and sleeps for none of it, which is why
- * the ceiling can be this generous without costing the common case anything.
- *
- * The delay is around the RETRY, not before the first attempt. */
-#define LASER_INQUIRY_MAX_ATTEMPTS 7
-#define LASER_INQUIRY_RETRY_MS     100
 #define SCSI_PDT_MASK           0x1f
+#define SCSI_PDT_DIRECT_ACCESS  0x00
 #define SCSI_PDT_CD_DVD         0x05
 
-/* INQUIRY allocation length. 36 bytes is the standard short form every
- * device must answer, and the size already validated on real hardware by
- * the classification probe this transport grew out of. */
+/* INQUIRY allocation length: the 36-byte standard short form every device
+ * must answer. */
 #define SCSI_INQUIRY_ALLOC_LEN  36
 
-/* Forward declaration: defined further down, but the spin-up wait below
- * needs it to interpret a TEST UNIT READY failure. */
+/* INQUIRY attempts on LUN 0, and the first delay between them, which doubles
+ * each time: 100, 200, ... 3200 ms, about six seconds over seven attempts.
+ *
+ * On a kernel that mounts optical media, a drive classified just after it was
+ * plugged in is caught mid-command by usb-storage, whose work nobody will now
+ * collect; the device needs time, not another command. A healthy one answers
+ * the first attempt and sleeps for none of it. */
+#define LASER_INQUIRY_MAX_ATTEMPTS 7
+#define LASER_INQUIRY_RETRY_MS     100
+
+/* Forward declaration: the spin-up wait needs it before its definition. */
 static int request_sense_locked(laser_entry_t *entry,
                                 uint8_t *sense_key, uint8_t *asc, uint8_t *ascq);
 
-/* SCSI TEST UNIT READY (opcode 0x00): no data phase, the CSW status
- * alone says whether the unit is ready.
+/* SCSI TEST UNIT READY (opcode 0x00): no data phase, the CSW status alone
+ * says whether the unit is ready.
  *
- * Returns laser_bot_send_locked()'s code verbatim rather than
- * collapsing it to 0/-1: the spin-up wait below has to tell "the drive is
- * busy spinning up" from "there is no drive on the bus any more", and
- * flattening every failure into -1 threw that distinction away. 0 still
- * means ready; BOT_FAIL_NO_DEVICE means gone; anything else means not
- * ready yet.
+ * Returns laser_bot_send_locked()'s code as is: 0 means ready,
+ * BOT_FAIL_NO_DEVICE means gone, anything else not ready yet.
  *
  * Caller MUST already hold entry->io_lock. */
 static int test_unit_ready_locked(laser_entry_t *entry)
@@ -265,10 +177,9 @@ static int test_unit_ready_locked(laser_entry_t *entry)
                                    NULL, 0, 0, NULL, &csw_status);
 }
 
-/* Milliseconds elapsed on CLOCK_MONOTONIC since *start. Monotonic
- * specifically: a wall-clock budget must not be lengthened or cut short
- * by the system clock being stepped, which on Android happens routinely
- * as NTP and the carrier's time settle after a boot or a network change. */
+/* Milliseconds elapsed since *start on CLOCK_MONOTONIC, so that a budget is
+ * not stretched or cut by the system clock being stepped, which Android does
+ * routinely after a boot or a network change. */
 static long monotonic_ms_since(const struct timespec *start)
 {
     struct timespec now;
@@ -277,57 +188,32 @@ static long monotonic_ms_since(const struct timespec *start)
            + (now.tv_nsec - start->tv_nsec) / 1000000L;
 }
 
-/* Only transfers at least this large are sampled. Smaller ones are dominated
- * by command latency rather than by the link, and a run of them would drag the
- * average down on a perfectly healthy drive. 32 KiB is comfortably above the
- * command-overhead regime and well below the negotiated chunk size, so an
- * ordinary read qualifies and a TEST UNIT READY never does. */
+/* Only transfers at least this large are sampled: smaller ones measure
+ * command latency, not the link. */
 #define LASER_XFER_SAMPLE_MIN_BYTES  (32 * 1024)
 
-/* How much has to be seen before the average is worth believing. One slow
- * transfer proves nothing: a seek, a spin-up, a retried stall. A whole
- * mebibyte of sustained reading is a measurement. */
+/* Bytes sampled before the average is believed: one slow transfer - a seek,
+ * a retried stall - proves nothing. */
 #define LASER_XFER_SAMPLE_BYTES      (1024 * 1024)
 
-/* Sampled transfers are also counted, so the report can give the SIZE AND
- * DURATION OF ONE, not only an aggregate rate. "256 KiB in 16 ms" invites a
- * direct comparison against a drive known to be healthy; "15961 KiB/s" has to
- * be converted in the reader's head first. Both are printed, since the rate
- * is what the threshold is expressed in. */
-
-/* The floor, in KiB/s, below which a link of the given wMaxPacketSize is not
- * performing as its speed implies.
- *
- * Set FAR below what the link can do, not near it: this is meant to catch a
- * drive running at a small fraction of its capability, and must never fire on
- * one that is merely unhurried. A high-speed link measured on healthy hardware
- * sustains around 15,000 KiB/s; the underpowered case that motivated this
- * managed 90. A floor of 1,000 leaves an order of magnitude of headroom in
- * both directions.
- *
- * Full speed gets its own, lower floor because ~1,000 KiB/s is roughly its
- * theoretical ceiling - applying the high-speed number there would fire on
- * every full-speed link, which is slow by nature rather than by fault. */
+/* The rate, in KiB/s, below which a link of this wMaxPacketSize is not
+ * performing as its speed implies. Far below what it can do, to catch only a
+ * drive running at a fraction of its capability: healthy high speed sustains
+ * about 15,000 KiB/s, the underpowered drive this was written for 90. Full
+ * speed gets a lower floor, ~1,000 KiB/s being its ceiling. */
 static uint32_t slow_floor_kib_per_s(uint16_t max_packet)
 {
     return max_packet <= 64 ? 250 : 1000;
 }
 
-/* Accumulates transfer throughput and says something, once, if it is far
- * below what the link should give.
+/* Accumulates read throughput, and reports it once per registration - as a
+ * warning if it is far below what the link should carry.
  *
- * THE FAILURE THIS EXISTS FOR LEAVES NO OTHER TRACE. A drive with too little
- * power enumerates, negotiates full speed, answers every command correctly
- * and reads at a fraction of the rate. There is no error to log because
- * nothing fails - it is all simply slow, and the only visible symptom is a
- * video output complaining that pictures arrive late, which points at
- * everything except the cause. Diagnosing it once took an external
- * measurement and several wrong theories; this is that measurement, kept.
- *
- * Latched: said once per registration, whether the verdict is good or bad.
- * A drive that is genuinely slow should not fill the log, and the healthy
- * reading is worth having in a bug report too. After the latch this costs one
- * comparison per transfer.
+ * An underpowered drive enumerates, answers every command correctly and
+ * reads at a fraction of its rate. Nothing fails, so nothing else here would
+ * report it; the only visible symptom is video arriving late, which points
+ * everywhere but at the cause. The healthy figure is logged too, for bug
+ * reports.
  *
  * Caller MUST already hold entry->io_lock. */
 static void sample_throughput_locked(laser_entry_t *entry, int data_len,
@@ -385,13 +271,10 @@ static void sample_throughput_locked(laser_entry_t *entry, int data_len,
          (unsigned long long)per_ms, entry->ep_max_packet);
 }
 
-/* One START STOP UNIT, in the exact shape asked for, reporting the drive's
- * sense when it refuses.
- *
- * Split out from spin_up_locked() below because the interesting behaviour is
- * entirely in WHICH shapes a given bridge accepts, and that is only legible
- * if each attempt is one call with one answer. Returns the CSW status, and
- * fills the sense triple when that status is FAIL. */
+/* One START STOP UNIT in the exact shape asked for. Returns the CSW status,
+ * and fills the sense triple when that status is FAIL - the sense being what
+ * tells a missing opcode from a wrong shape from a refusal of the drive's
+ * own. */
 static int start_stop_unit_locked(laser_entry_t *entry,
                                   uint8_t immed, uint8_t byte4,
                                   uint8_t *sense_key, uint8_t *asc,
@@ -411,12 +294,6 @@ static int start_stop_unit_locked(laser_entry_t *entry,
     *ascq = 0;
 
     if (rc != 0 && csw_status == USB_BOT_STATUS_FAIL) {
-        /* THE POINT OF THIS HELPER. A refusal logged as a bare status says
-         * only that the drive said no; the sense says whether the opcode is
-         * missing, the shape is wrong, or the drive is declining for a
-         * reason that has nothing to do with the CDB - and those need three
-         * different responses. Not asking was the gap in the first version
-         * of this code. */
         request_sense_locked(entry, sense_key, asc, ascq);
     }
 
@@ -428,48 +305,32 @@ static int start_stop_unit_locked(laser_entry_t *entry,
     return csw_status;
 }
 
-/* Tell the drive to load and spin its medium, escalating through the shapes a
- * bridge might accept.
+/* Tell the drive to load and spin its medium up, escalating through the
+ * shapes a bridge might accept.
  *
- * THIS IS THE COMMAND NOBODY WAS SENDING, and its absence is why a drive with
- * a readable disc in a closed tray could answer MEDIUM NOT PRESENT forever.
+ * TEST UNIT READY is a status query: some firmware starts the mechanism on
+ * it, some does not, and a drive of the latter kind would answer MEDIUM NOT
+ * PRESENT about a readable disc forever. On Linux, sr_mod sends this command
+ * when the device is opened; with the kernel driver detached, nothing else
+ * would.
  *
- * TEST UNIT READY does not start a mechanism. It is a status query, and the
- * loop below is a poll, not a prod - some firmware happens to auto-start on
- * it, and this bridge does not. On Linux that job belongs to sr_mod, which
- * issues 1Bh when the device is opened; laser_register() detaches the kernel
- * driver and, until now, nothing took the job over.
+ * Byte 4: bit 0 START, bit 1 LOEJ ("load first"). IMMED is set on the first
+ * attempt because a blocking spin-up can outlast bot.c's fixed phase
+ * timeouts.
  *
- * Byte 4: bit 0 START, bit 1 LOEJ. 0x01 spins up a medium already loaded;
- * 0x03 adds "load it first". Byte 1 bit 0 is IMMED, set on the first attempt
- * because bot.c's phase timeouts are fixed at 3000/5000/3000ms with no
- * per-command override and a blocking Blu-ray spin-up can outlast them - a
- * timeout there costs a stall recovery and tells us nothing.
+ *   1.  IMMED, START: the correct request, and the cheapest.
+ *   2a. 05h/20h INVALID OPCODE: stop. Every other shape is the same opcode.
+ *   2b. 05h/24h INVALID FIELD IN CDB: retry without IMMED, the field ATAPI
+ *       bridges most often lack. This one may block for the whole spin-up.
+ *   2c. anything else: retry with LOEJ, "load the medium" being a different
+ *       request from "spin what you have". A 05h/24h answer to that names
+ *       LOEJ, so the ladder ends there: a drive with no motorised load
+ *       refuses it with or without IMMED, as a 152d:0583 bridge showed.
  *
- * The escalation, and why each step is where it is:
+ * Never with the tray open: LOEJ would close it. Best-effort; the caller
+ * polls either way.
  *
- *   1. IMMED=1, START.        The correct request, and the cheapest.
- *   2a. 05h/20h INVALID OPCODE -> STOP. The bridge does not implement 1Bh at
- *       all; every further shape is the same command and will be refused the
- *       same way. Nothing here can make this drive load, and saying so in the
- *       log is more useful than two more refusals.
- *   2b. 05h/24h INVALID FIELD IN CDB -> retry WITHOUT IMMED. The opcode
- *       exists and the shape was wrong; IMMED is the field most often
- *       unsupported on ATAPI bridges. This one can block for the whole
- *       spin-up, which is why it is not tried first.
- *   2c. anything else -> retry with LOEJ. A refusal that names neither the
- *       opcode nor a field is the drive declining on its own terms, and
- *       "load the medium" is a different request from "spin what you have".
- *       05h/24h HERE names LOEJ, not IMMED - it is the bit this shape adds -
- *       so the ladder ends: a drive with no motorised load refuses it with
- *       IMMED set or clear alike. Tried and measured on a 152d:0583 bridge,
- *       which answered both shapes identically; the extra command bought
- *       nothing and every trayless drive would have paid for it.
- *
- * NEVER on 3Ah/02h: LOEJ closes a tray, and the caller must not reach here
- * with the tray open. Best-effort throughout - a drive that refuses every
- * shape is no worse off than before it was asked, and the caller carries on
- * polling either way. Caller MUST already hold entry->io_lock. */
+ * Caller MUST already hold entry->io_lock. */
 static void spin_up_locked(laser_entry_t *entry)
 {
     uint8_t sense_key, asc, ascq;
@@ -500,23 +361,14 @@ static void spin_up_locked(laser_entry_t *entry)
     start_stop_unit_locked(entry, 1, 0x03, &sense_key, &asc, &ascq);
 }
 
-/* GET EVENT STATUS NOTIFICATION (opcode 4Ah), media event class, polled.
- * Purely diagnostic: it changes nothing, it only reports what the drive
- * believes about the tray and the medium.
+/* GET EVENT STATUS NOTIFICATION (opcode 4Ah), media class, polled: what the
+ * drive believes about its tray and medium, for the log of a given-up wait.
  *
- * TEST UNIT READY answers "not ready" without saying why, and REQUEST SENSE
- * reports MEDIUM NOT PRESENT both for an open tray and for a bridge that has
- * lost track of a disc that is physically there. 4Ah carries a tray-open bit,
- * a media-present bit, and the event code of the last media change.
+ * Diagnostic only, and not ground truth: it is the same firmware's belief as
+ * the sense data, and has reported "tray closed, medium absent" for a disc
+ * read moments later. Decisions are made on the sense qualifier.
  *
- * DO NOT TREAT ANY OF THAT AS GROUND TRUTH. It is a second reading of the
- * same firmware's belief, not an independent one, and it has been observed
- * reporting "tray closed, medium absent" for a disc that was physically
- * present and readable moments later. It corroborates rather than arbitrates,
- * which is why nothing here branches on it and it only ever reaches the log:
- * a give-up recorded with the drive's own account of itself is worth more
- * than one recorded with a verdict alone. The sense qualifier is what
- * decisions are made on. Caller MUST already hold entry->io_lock. */
+ * Caller MUST already hold entry->io_lock. */
 static void log_media_status_locked(laser_entry_t *entry)
 {
     uint8_t cdb[10] = { 0 };
@@ -562,93 +414,48 @@ static void log_media_status_locked(laser_entry_t *entry)
          no_event, class, buf[2], buf[3], buf[4], buf[5]);
 }
 
-/* Wake the drive and wait for its medium to become ready before any read
- * is attempted.
+/* Wake the drive and wait for its medium to become ready - see the contract
+ * in laser_internal.h.
  *
- * This is the single most important thing the POC did that the module
- * initially did not: an optical drive that has spun its disc down (or
- * never spun it up since the disc was inserted) answers the very first
- * data-bearing command with NOT READY / becoming-ready, and - depending
- * on firmware - a READ that arrives cold may fail outright rather than
- * kick off the spin-up. A TEST UNIT READY is the command whose whole
- * purpose is to prod the unit and report its state; issuing it in a loop
- * both starts the mechanical spin-up and waits for it to finish.
+ * A drive that has spun down, or never spun up since the disc went in,
+ * answers the first data command NOT READY, and some firmware fails a READ
+ * that arrives cold rather than starting the spin-up. So: one START STOP
+ * UNIT, then TEST UNIT READY in a loop until the unit answers ready.
  *
- * Mechanical spin-up of a cold DVD can take well over the transport's
- * ordinary per-command retry budget - several seconds, sometimes more
- * than ten - so this has its own, longer budget, separate from
- * LASER_MAX_RETRIES. That budget has two independent ceilings, and
- * whichever is reached first ends the wait:
+ * The loop ends early on a tray open (3Ah/02h), which no command closes, and
+ * on a device that has left the bus. Other 3Ah answers keep it polling under
+ * LASER_NO_MEDIUM_MAX_WALL_MS; everything else under LASER_SPINUP_MAX_WALL_MS
+ * and LASER_SPINUP_MAX_ATTEMPTS.
  *
- *   - LASER_SPINUP_MAX_ATTEMPTS, which bounds how many times a
- *     drive that keeps answering "not yet" is asked again;
- *   - LASER_SPINUP_MAX_WALL_MS, which bounds the real time spent,
- *     and is what stops a drive that has stopped answering from turning
- *     the attempt budget into minutes of USB timeouts (see that
- *     constant's own comment - this function runs with the registry
- *     lock held, so those minutes block teardown too).
- *
- * Two conditions end it earlier still, because neither can be improved
- * on by waiting: MEDIUM NOT PRESENT WITH THE TRAY OPEN, which no command
- * can close; and the device having left the bus altogether, which TEST
- * UNIT READY now reports distinctly rather than as one more "not ready".
- *
- * The other MEDIUM NOT PRESENT qualifiers do not end it either. 3Ah/00h and
- * 3Ah/01h are what a parked drive answers about a disc in its own closed
- * tray, so treating them as conclusive rejected valid discs; the poll
- * carries on under its own shorter ceiling (LASER_NO_MEDIUM_MAX_WALL_MS),
- * measured from the START STOP UNIT below.
- *
- * Best-effort: a drive that never reports ready still falls through to
- * the caller, which will find out soon enough when its first real read
- * fails. Runs on LUN 0 (entry->lun before discovery); that is enough to
- * spin the mechanism up, and LUN discovery's own INQUIRY follows. */
+ * Not cancellable, and it need not be: it runs inside laser_acquire(), under
+ * g_registry_lock, on an entry not yet published. */
 void laser_wait_until_ready(laser_entry_t *entry)
 {
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
 
-    /* One START STOP UNIT per wait, not one per attempt: it is a request to
-     * start a mechanism, and repeating it at a drive already starting is at
-     * best noise. no_medium_since is set when it goes out, so the shorter
-     * ceiling measures time given to the drive AFTER it was asked to load,
-     * which is the only interval during which "not yet" is informative. */
-    int spun_up = 0;
+    /* When START STOP UNIT went out: the start of the no-medium ceiling,
+     * since "not yet" only means something once the drive was asked to
+     * load. */
     struct timespec no_medium_since = started;
 
     pthread_mutex_lock(&entry->io_lock);
 
-    /* Sent before the drive is asked anything, rather than on a first answer
-     * that happens to be 3Ah. Polling with TEST UNIT READY does not start
-     * every mechanism: a drive reporting 02h/04h/01h - becoming ready - as a
-     * generic busy state never reaches the no-medium branch below, so nothing
-     * ever tells it to load and the wait polls a drive that was never
-     * started, until the budget runs out. Asking first costs one command on a
-     * drive that did not need it, which its own escalation ladder ends at the
-     * first good status. */
+    /* Asked before the first poll rather than on a first 3Ah answer: a drive
+     * answering "becoming ready" as a generic busy state would otherwise
+     * never be told to load. One command too many on a drive that did not
+     * need it. */
     spin_up_locked(entry);
-    spun_up = 1;
     clock_gettime(CLOCK_MONOTONIC, &no_medium_since);
 
-    /* Raised for the duration and lowered only by the ready return below, so
-     * that every way out of this loop other than success leaves it standing,
-     * including ones added later. Also clears it on a re-registration of a
-     * reused slot. */
+    /* Lowered only by the ready return below, so that every other way out of
+     * the loop leaves it raised. */
     entry->not_ready = 1;
 
-    /* Whether the drive has told us it is spinning up. Only read by the
-     * device-gone branch below, which needs to say what the drive was doing
-     * when it vanished. */
+    /* Whether the drive said it was spinning up, for the device-gone report
+     * below. */
     int becoming_ready = 0;
 
-    /* NOT CANCELLABLE, and it cannot be: this runs inside laser_acquire(),
-     * under g_registry_lock, on an entry that has not been published yet - so
-     * nothing can look the token up, and cancellation is set only by the
-     * laser_release() that would have to take that same lock to get here.
-     *
-     * What bounds it is LASER_SPINUP_MAX_WALL_MS, checked below - or, on the
-     * no-medium path, LASER_NO_MEDIUM_MAX_WALL_MS, which is stricter and so
-     * bounds that path on its own without reaching the check below. */
     for (int attempt = 1; attempt <= LASER_SPINUP_MAX_ATTEMPTS; attempt++) {
         int rc = test_unit_ready_locked(entry);
 
@@ -662,22 +469,12 @@ void laser_wait_until_ready(laser_entry_t *entry)
         }
 
         if (rc == BOT_FAIL_NO_DEVICE) {
-            /* Not a drive that needs more time - a drive that is not
-             * there. Every remaining attempt would spend two full sets of
-             * USB timeouts confirming it. Stop at once; registration goes
-             * on to fail, or the first real command does, which is the
-             * honest outcome either way. */
             LOGW("token=%d: device gone during spin-up wait, abandoning it",
                  entry->token);
 
-            /* A drive that left the bus WHILE SPINNING UP is the signature of
-             * a supply that cannot carry the spindle: a cold optical drive
-             * draws its peak current getting the disc up to speed, and a port
-             * that cannot deliver it browns the bridge out mid-command. The
-             * device then re-enumerates at a new address and the cycle
-             * repeats, audibly. Worth naming, because every layer above sees
-             * only a device that disappeared - and because nothing in this
-             * library can fix it, while a powered hub can. */
+            /* Leaving the bus while spinning up - when a cold drive draws its
+             * peak current - is the signature of a port that cannot power it.
+             * Every layer above only sees a device that disappeared. */
             if (becoming_ready) {
                 LOGW("token=%d: it was spinning up when it went (%ldms in) - "
                      "suspect the port's power budget, not the drive: try a "
@@ -692,10 +489,8 @@ void laser_wait_until_ready(laser_entry_t *entry)
         uint8_t sense_key = 0xff, asc = 0, ascq = 0;
         request_sense_locked(entry, &sense_key, &asc, &ascq);
 
-        /* Logged raw rather than only through the branches below: 02h/3Ah
-         * (no medium), 02h/04h/01h (becoming ready) and 06h/28h/00h (medium
-         * may have changed) demand different handling, and telling them apart
-         * from the aggregated messages alone is guesswork. */
+        /* Logged raw: 02h/3Ah, 02h/04h/01h and 06h/28h/00h call for different
+         * handling, and the messages below do not show which arrived. */
         LOGI("token=%d: sense %02x/%02x/%02x (attempt %d/%d)",
              entry->token, sense_key, asc, ascq, attempt,
              LASER_SPINUP_MAX_ATTEMPTS);
@@ -708,29 +503,16 @@ void laser_wait_until_ready(laser_entry_t *entry)
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
             if (ascq == SCSI_ASCQ_TRAY_OPEN) {
-                /* The one qualifier worth believing. Nothing this code can
-                 * send closes a tray, so waiting is pure cost. */
                 LOGW("token=%d: tray open (attempt %d/%d), giving up wait",
                      entry->token, attempt, LASER_SPINUP_MAX_ATTEMPTS);
-                /* Ask the drive what it thinks the tray and the medium are
-                 * doing, so the give-up is recorded with a reason rather
-                 * than only with a verdict. */
                 log_media_status_locked(entry);
                 pthread_mutex_unlock(&entry->io_lock);
                 return;
             }
 
-            /* Tray closed, or no qualifier at all: the drive has no medium
-             * state, which an empty tray and a parked drive holding a disc
-             * produce alike. Tell it to load, once, and keep polling - the
-             * shorter ceiling below is what bounds the empty case. */
-            if (!spun_up) {
-                spun_up = 1;
-                spin_up_locked(entry);
-                clock_gettime(CLOCK_MONOTONIC, &no_medium_since);
-                continue;
-            }
-
+            /* Tray closed, or no qualifier: an empty tray and a parked drive
+             * holding a disc alike. Keep polling; the shorter ceiling bounds
+             * the empty case. */
             long no_medium_ms = monotonic_ms_since(&no_medium_since);
             if (no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS) {
                 LOGW("token=%d: still no medium %ldms after START STOP UNIT "
@@ -751,13 +533,9 @@ void laser_wait_until_ready(laser_entry_t *entry)
             continue;
         }
 
-        /* Wall-clock check before committing to another round, so the
-         * ceiling bounds the time actually spent rather than being
-         * noticed one full attempt late. Placed after the sense checks so
-         * that a conclusive answer - an open tray - still ends the wait on
-         * its own terms rather than as a timeout, and so that the no-medium
-         * path above is measured against its own shorter ceiling instead of
-         * this one. */
+        /* Checked before committing to another round, so that the ceiling
+         * bounds the time actually spent; after the sense checks, so that an
+         * open tray or a missing medium ends the wait on its own terms. */
         long elapsed = monotonic_ms_since(&started);
         if (elapsed >= LASER_SPINUP_MAX_WALL_MS) {
             LOGW("token=%d: spin-up wall-clock budget exhausted (%ldms over "
@@ -784,12 +562,9 @@ void laser_wait_until_ready(laser_entry_t *entry)
     pthread_mutex_unlock(&entry->io_lock);
 }
 
-/* One INQUIRY on the unit currently selected by entry->lun.
- *
- * UNDER THE PROBE TIMEOUTS, always, and that is why selecting the unit and
- * classifying it are one function rather than two. At the READ timeouts a
- * multi-LUN device with an absent unit spends eleven seconds per LUN inside
- * registration, with the registry lock held.
+/* One INQUIRY on the unit selected by entry->lun, under the probe timeouts:
+ * at the read timeouts, an absent unit of a multi-LUN device would cost
+ * eleven seconds of registration.
  *
  * @param pdt receives the peripheral device type on success.
  * @return 0 on success, BOT_FAIL_NO_DEVICE if the device is gone, -1 if the
@@ -828,10 +603,8 @@ static int inquiry_pdt(laser_entry_t *entry, int attempts, uint8_t *pdt)
             break;
         }
 
-        /* Doubling from LASER_INQUIRY_RETRY_MS. Waiting is the whole point -
-         * see the constant's comment - so the sleep is what the retry
-         * actually consists of; the command itself has already failed as
-         * fast as it is going to. */
+        /* Doubling from LASER_INQUIRY_RETRY_MS: the wait is what the retry
+         * consists of. */
         const int delay_ms = LASER_INQUIRY_RETRY_MS << (attempt - 1);
 
         LOGI("token=%d: LUN %u INQUIRY unanswered (rc=%d, %d bytes, "
@@ -847,8 +620,7 @@ static int inquiry_pdt(laser_entry_t *entry, int attempts, uint8_t *pdt)
 
 int laser_probe_lun(laser_entry_t *entry)
 {
-    /* Default, and the answer for almost every drive. Set before anything
-     * else so that every early return below leaves a usable value behind. */
+    /* Set first, so that every early return leaves a usable value. */
     entry->lun = 0;
 
     unsigned char max_lun_buf = 0;
@@ -859,10 +631,8 @@ int laser_probe_lun(laser_entry_t *entry)
                                       &max_lun_buf, 1, 3000);
     int max_lun = 0;
     if (ret != 1) {
-        /* Stalled or otherwise unanswered. The class specification is
-         * explicit that this means a single logical unit, so this is a
-         * normal outcome and not worth warning about - most drives take
-         * this path. */
+        /* Stalled or unanswered means a single unit, per the class
+         * specification: the common case, not worth a warning. */
         LOGI("token=%d: GET MAX LUN unsupported or failed, assuming single LUN",
              entry->token);
     } else {
@@ -875,17 +645,13 @@ int laser_probe_lun(laser_entry_t *entry)
         }
     }
 
-    /* Ask each unit what it is and take the first CD/DVD one. INQUIRY is
-     * addressed per-LUN through the CBW, so entry->lun is what selects the
-     * target - it is restored to a sane value on every exit path below.
+    /* Ask each unit what it is, and take the first CD/DVD one. entry->lun
+     * selects the unit the CBW addresses.
      *
-     * ONLY LUN 0 IS RETRIED. The retry exists because the first attempt lands
-     * right after the Mass Storage Reset and is the first real command the
-     * device sees: a bridge still settling answers it with a Phase Error and
-     * the next one with data. That reason applies to the first command and to
-     * no other, so spending it again on units 1..3 - which are usually absent
-     * on the drives that report them - would multiply the cost of the case
-     * this is trying to keep cheap. */
+     * Only LUN 0 is retried: its INQUIRY is the first command after the Mass
+     * Storage Reset, which a bridge still settling may fail. Units 1..3 are
+     * usually absent on the drives that report them, and retrying them would
+     * multiply the cost of the case this keeps cheap. */
     uint8_t lun0_pdt = 0;
     int have_lun0_pdt = 0;
 
@@ -919,19 +685,13 @@ int laser_probe_lun(laser_entry_t *entry)
         }
     }
 
-    /* Nothing identified itself as optical. Fall back to LUN 0 rather than to
-     * whatever the loop happened to leave behind: INQUIRY data is not always
-     * truthful, and LUN 0 at least matches how this transport behaved before
-     * LUN discovery existed. */
+    /* No unit said optical: back to LUN 0 rather than wherever the loop
+     * stopped. */
     entry->lun = 0;
 
     if (!have_lun0_pdt) {
-        /* Nothing answered at all. NOT reported as "not optical": a device
-         * that cannot be asked has not answered no, and rejecting on silence
-         * would make a merely slow drive silently unusable. Reported as its
-         * own outcome so the caller can stop treating this device as one that
-         * might just be warming up - INQUIRY needs no medium, so failing it
-         * means the device is not talking at all. */
+        /* INQUIRY needs no medium: a device that answers it on no unit is not
+         * talking at all. */
         LOGI("token=%d: INQUIRY unanswered on every unit", entry->token);
         return LASER_OPTICAL_NO_ANSWER;
     }
@@ -941,18 +701,10 @@ int laser_probe_lun(laser_entry_t *entry)
                          "falling back to LUN 0");
     }
 
-    /* Only the block-device type is rejected, not "everything that is not
-     * 0x05". Combo enclosures pair an optical drive with a card reader behind
-     * two bridges that are indistinguishable at the USB descriptor level, and
-     * the card reader is exactly what answers 0x00 here - as does a USB key
-     * or an external disk, both of which Android already handles through its
-     * own storage path.
-     *
-     * A drive whose bridge reports some other unexpected type is still
-     * accepted, because INQUIRY data is not always truthful - the same reason
-     * the fallback above prefers LUN 0 to a negative result - and losing a
-     * real optical drive to a lying descriptor would be a far worse failure
-     * than probing one device too many. */
+    /* Only a direct-access block device is rejected - a card reader, a USB
+     * key, an external disk, which Android serves through its own storage
+     * path. Any other unexpected type is accepted: losing a real drive to a
+     * lying descriptor would be far worse than probing one device too many. */
     if (lun0_pdt == SCSI_PDT_DIRECT_ACCESS) {
         LOGI("token=%d: direct-access block device, not an optical drive",
              entry->token);
@@ -986,9 +738,8 @@ static int request_sense_locked(laser_entry_t *entry,
 }
 
 /* ============================================================================
- * Public: laser_scsi_cdb() - the generic, retrying, mutex-protected
- * CDB primitive every higher-level helper and every patched call site
- * ultimately goes through.
+ * Public: laser_scsi_cdb() - the generic, retrying, mutex-protected CDB
+ * primitive everything else goes through.
  * ============================================================================ */
 
 laser_status_t laser_scsi_cdb(int token,
@@ -996,20 +747,11 @@ laser_status_t laser_scsi_cdb(int token,
                               uint8_t *data, int data_len,
                               int data_in, int *actual_len)
 {
-    /* Argument validation first, before anything expensive. Getting this
-     * wrong is a caller bug, and the failures it produces are all far
-     * away from their cause: an oversized cdb_len overflows a stack
-     * struct inside the CBW builder, and a NULL data with a non-zero
-     * data_len announces a data phase in the CBW that then never
-     * happens - the drive waits for bytes that never come, stalls, and
-     * the transaction ends in a Reset Recovery with nothing in the log
-     * pointing at the real mistake.
-     *
-     * Checked here rather than deeper down because this is the boundary
-     * the contract in laser.h describes, and because a bad call
-     * must not trigger the one-time device registration below - a
-     * malformed command is no reason to spend fifteen seconds spinning a
-     * drive up. */
+    /* Caller bugs, caught here because their symptoms appear far from the
+     * cause: an oversized cdb_len overflows the CBW's 16-byte field, and a
+     * NULL buffer with a data length announces a data phase that never
+     * happens, ending in a Reset Recovery with nothing in the log pointing
+     * at the mistake. */
     if (cdb == NULL || cdb_len <= 0 || cdb_len > 16) {
         LOGE("token=%d: invalid CDB (%p, %d bytes; expected 1-16)",
              token, (const void *)cdb, cdb_len);
@@ -1021,30 +763,17 @@ laser_status_t laser_scsi_cdb(int token,
         return LASER_ERR_INVALID;
     }
     if (data_len > LASER_MAX_BYTES_PER_TRANSFER) {
-        /* Warned about, not rejected. The transfer may well succeed -
-         * libusb splits it to satisfy the OS - and refusing a call that
-         * would have worked is worse than letting it through. But it is
-         * outside what this transport keeps within reliably across
-         * Android host controllers, and the block helpers below exist
-         * precisely so no caller has to do this. */
+        /* Warned about, not rejected: libusb may well carry it, but it is
+         * beyond what is reliable across Android host controllers, and the
+         * block helpers exist so that nobody has to. */
         LOGW("token=%d: %d-byte data phase exceeds the %d-byte per-transfer "
              "budget; prefer laser_read_blocks()/read_cd_blocks()",
              token, data_len, LASER_MAX_BYTES_PER_TRANSFER);
     }
 
-    /* lookup(), and NOT a lookup-or-register. A command on an unclaimed token
-     * answers exactly as one on a token that was never valid: NO_SUCH_TOKEN,
-     * immediately, with nothing set up.
-     *
-     * Registering here instead would leave no way back. The registration
-     * would belong to nobody, teardown only ever happens when a claim count
-     * falls to zero, and a count never incremented never falls: the entry
-     * would hold a libusb handle and a table slot until the process died, and
-     * once its owner closed the descriptor and the OS recycled the number,
-     * that stale entry would answer for a different device. Every
-     * consumer in this project calls laser_acquire() first - the access
-     * module in both Open paths, cdrom.c in ioctl_Open(), libdvdcss in
-     * dvdcss_open() - so what this catches is a caller that forgets. */
+    /* A lookup, never a registration: a command on an unclaimed token is a
+     * caller bug, and registering here would create an entry nobody
+     * releases. */
     laser_entry_t *entry = laser_lookup(token);
     if (entry == NULL) {
         LOGW("token=%d: no such token - is a claim held? "
@@ -1052,30 +781,16 @@ laser_status_t laser_scsi_cdb(int token,
         return LASER_ERR_NO_SUCH_TOKEN;
     }
 
-    /* Does this command change the drive's CSS authentication state? Keyed on
-     * the key FORMAT, not the opcode - see laser_cdb_changes_css_state().
-     * Two decisions need exactly this answer: whether a session is required,
-     * and whether a retry is safe. */
+    /* Whether this command changes CSS authentication state decides two
+     * things: whether a session is required, and whether a retry is safe. */
     const int css_state_changing = laser_cdb_changes_css_state(cdb, cdb_len);
 
-    /* A state-changing key command outside any session is refused, not fixed
-     * up.
+    /* Refused outside any session rather than wrapped in one: exclusion over
+     * a single transaction is io_lock already, and what needs protecting is
+     * the sequence, which only the consumer can see. This stops an
+     * undeclared consumer from taking an AGID mid-handshake.
      *
-     * Making the session implicit here was the alternative: take the session
-     * around this one command and drop it after. It reads as the smaller
-     * change and it is worthless - exclusion spanning one transaction IS
-     * io_lock, two lines below. What needs protecting is the SEQUENCE, and
-     * this layer cannot see sequences: the first command of a handshake and a
-     * stray AGID request from an unrelated thread are the same bytes. Only the
-     * consumer can tell them apart, so it declares a session and this checks
-     * the declaration was made.
-     *
-     * Deliberately not "is the session MINE": one consumer's key commands
-     * legitimately arrive from several threads, and the cookie that identifies
-     * it does not reach this far. What this stops is an UNDECLARED consumer
-     * stealing an AGID, which is the accident actually observed.
-     *
-     * Runs before io_lock - see the lock order in registry.c. */
+     * Checked before io_lock - see the lock order in registry.c. */
     if (css_state_changing && !laser_css_session_is_open(entry)) {
         LOGE("token=%d, usb %04x:%04x: CSS command 0x%02x issued with no "
              "session open - refused. Call laser_css_session_begin() "
@@ -1084,17 +799,12 @@ laser_status_t laser_scsi_cdb(int token,
         return LASER_ERR_IO;
     }
 
-    /* Cancelled before we even queue for the device. Checked here rather than
-     * only inside the loop so that a command arriving after teardown began
-     * does not first wait out whatever transaction is currently holding
-     * io_lock - which on the drive this exists for is the slow one. */
+    /* Before queueing on io_lock, so that a command arriving during teardown
+     * does not first wait out the transaction in progress. */
     if (laser_is_cancelled(entry)) {
         return LASER_ERR_CANCELLED;
     }
 
-    /* Already known to be gone. Answered here, before io_lock and before
-     * libusb, because everything below this point would spend the whole retry
-     * budget rediscovering it - see laser_entry_t::device_gone. */
     if (entry->device_gone) {
         return LASER_ERR_NO_DEVICE;
     }
@@ -1103,71 +813,38 @@ laser_status_t laser_scsi_cdb(int token,
 
     laser_status_t result = LASER_ERR_IO;
 
-    /* Is this command safe to send twice? DATA-IN commands here are all
-     * reads (READ(10), READ CD, READ TOC, REPORT KEY, READ DVD
-     * STRUCTURE): re-issuing one returns the same data and leaves the
-     * drive where it was. DATA-OUT means SEND KEY, which is a step in
-     * the CSS authentication handshake - an explicit state machine in
-     * the drive (request AGID, host challenge, key1, drive challenge,
-     * key2), where each accepted command advances the logical unit to
-     * the next state. Replaying a step the drive already accepted
-     * desynchronises host and drive, and the resulting failure surfaces
-     * later and elsewhere, as an unexplained authentication error.
+    /* Is this command safe to send twice? Reads are. A command changing CSS
+     * state is not: each accepted handshake step advances the drive's state
+     * machine, and every accepted AGID request takes one of the drive's four
+     * AGIDs - a retry through a UNIT ATTENTION could exhaust them until the
+     * drive is unplugged. Recovering such a failure - invalidating the AGID
+     * and starting over - is libdvdcss's job.
      *
-     * libdvdcss already owns recovery for exactly this situation - it
-     * resets a hung authentication by invalidating the AGID and
-     * restarting the handshake from the top. That is the layer with the
-     * context to do it correctly; this one does not have it, so the
-     * right thing here is to report the failure and let the CSS code
-     * above decide, rather than blindly re-sending.
-     *
-     * NOT KEYED ON DIRECTION, which is the trap here: three of that state
-     * machine's five steps (request AGID, report key1, report drive
-     * challenge) are REPORT KEY, i.e. DATA-IN, so a direction test would mark
-     * them retryable. The worst case is not desynchronisation but
-     * EXHAUSTION: REPORT KEY format 00h is DATA-IN with
-     * an 8-byte data phase, and every accepted one ALLOCATES one of the
-     * drive's four AGIDs, so a single call retried through a UNIT ATTENTION
-     * could consume all four and leave the drive unable to authenticate
-     * anything until physically unplugged.
-     *
-     * Keyed on the same predicate as the session check, so that read-only key
-     * commands - copyright, RPC state, ASF - keep their retries. They are how
-     * libdvdcss decides whether the disc is scrambled at all, and losing a
-     * retry there would turn a transient into "CSS disabled for this disc". */
+     * Not keyed on direction: three handshake steps are REPORT KEY, which is
+     * DATA-IN. And keyed on the same predicate as the session check, so that
+     * the read-only key queries libdvdcss uses to decide whether a disc is
+     * scrambled at all keep their retries. */
     const int idempotent = !css_state_changing && (data_in || data_len == 0);
 
-    /* Last sense data seen, kept across attempts so the final failure can
-     * report WHY rather than only that it happened. Without it the log
-     * said "command failed after 6 attempts" and nothing more, which
-     * cannot separate a scratched sector from an out-of-range LBA from a
-     * drive refusing a protected read - three conditions with three
-     * completely different answers. */
+    /* Last sense seen, so that the final failure can say why. */
     uint8_t last_sense_key = 0xff, last_asc = 0, last_ascq = 0;
 
-    /* How many attempts were actually made, and whether one of the paths
-     * below already explained the failure in its own words. Both exist so
-     * the summary at the end cannot contradict the lines above it: a
-     * command that broke out on the first refusal must not then be
-     * reported as having exhausted a six-attempt budget it never touched.
-     * (int rather than bool: this file has no <stdbool.h> and uses int
-     * flags throughout.) */
+    /* Attempts made, and whether a branch below already explained the
+     * failure: the summary at the end must not claim a budget was exhausted
+     * when the loop broke out on the first refusal. */
     int attempts_made = 0;
     int reason_logged = 0;
 
-    /* How many attempts in a row failed before the CBW could be handed over.
-     * See the verdict at the end of the loop: a device that cannot accept 31
-     * bytes on its bulk endpoint, every time, for the whole budget, is not a
-     * device that is busy. */
+    /* Attempts that failed before the CBW could be handed over - see the
+     * verdict after the loop. */
     int cbw_never_sent = 0;
 
     for (int attempt = 1; attempt <= LASER_MAX_RETRIES; attempt++) {
         attempts_made = attempt;
 
-        /* Between attempts, which is the granularity cancellation offers:
-         * the transfer already handed to the kernel runs to its timeout, but
-         * the five that would have followed it do not happen. That is what
-         * turns a minute into a phase. */
+        /* Cancellation is honoured between attempts: a transfer already
+         * handed to the kernel runs to its timeout, but no further attempt
+         * follows. */
         if (laser_is_cancelled(entry)) {
             LOGI("token=%d: cancelled, abandoning cdb 0x%02x after %d "
                  "attempt(s)", token, cdb[0], attempt - 1);
@@ -1184,16 +861,9 @@ laser_status_t laser_scsi_cdb(int token,
         int rc = laser_bot_send_locked(entry, cdb, cdb_len, data, data_len,
                                          data_in, actual_len, &csw_status);
         if (rc == 0) {
-            /* SUCCESS AFTER A RETRY IS WORTH A LINE. Every path that gives
-             * up says so, and this one used to say nothing at all - so a
-             * command that failed twice and then worked left no trace, and a
-             * drive limping through its whole budget on every command looked
-             * identical in the log to one answering first time. That is a
-             * blind spot of exactly the shape this file's other logging
-             * exists to prevent, and it misdirects a diagnosis the same way:
-             * "no errors in the log" stops meaning "nothing went wrong".
-             *
-             * Only when attempt > 1, so the ordinary case stays silent. */
+            /* A success after retries is logged: otherwise a drive limping
+             * through its budget on every command looks, in the log, like
+             * one answering at once. */
             if (attempt > 1) {
                 LOGW("token=%d: cdb 0x%02x succeeded on attempt %d/%d - "
                      "earlier attempts failed and were retried",
@@ -1204,38 +874,23 @@ laser_status_t laser_scsi_cdb(int token,
             break;
         }
 
-        /* Counted, not acted on here: one failure to hand the CBW over says
-         * nothing - a bridge under load, a transient on the bus. The verdict
-         * needs the whole budget, so it is drawn after the loop. */
         if (rc == BOT_FAIL_NOT_SENT) {
             cbw_never_sent++;
         }
 
         if (rc == BOT_FAIL_NO_DEVICE) {
-            /* The drive has left the bus. Retrying cannot bring it back, and
-             * each further attempt costs a full set of USB timeouts to
-             * establish the same thing - on an unplug mid-playback, that is
-             * the difference between failing at once and failing a minute
-             * later, per read, with libVLC's input thread stalled
-             * throughout.
-             *
-             * REPORTED AS ITS OWN STATUS, because this is the strongest
-             * statement this layer can make and flattening it into ERR_IO
-             * loses the only thing a caller can act on. An I/O error invites
-             * a retry; a caller that retries here walks a whole UDF tree one
-             * dead command at a time. ERR_MEDIA_GONE would be latched
-             * correctly by every consumer, but it says the drive answered,
-             * which it did not. */
+            /* No retry can bring the drive back, and each would cost a full
+             * set of USB timeouts. Reported as its own status: an I/O error
+             * would invite retries, and MEDIA_GONE would say the drive
+             * answered. */
             LOGW("token=%d: device no longer present, not retrying", token);
             entry->device_gone = 1;
             result = LASER_ERR_NO_DEVICE;
             break;
         }
 
-        /* A non-idempotent command that the drive may already have acted
-         * on: stop here. BOT_FAIL_NOT_SENT is the exception - the CBW
-         * never got out, so the drive's state is untouched and a retry
-         * is as safe as for any read. */
+        /* A non-idempotent command the drive may have acted on: stop. Unless
+         * the CBW never left, in which case the drive's state is untouched. */
         if (!idempotent && rc != BOT_FAIL_NOT_SENT) {
             LOGW("token=%d: DATA-OUT command failed after the CBW was sent, "
                  "not retrying (drive state may have advanced)", token);
@@ -1245,13 +900,8 @@ laser_status_t laser_scsi_cdb(int token,
 
         uint8_t sense_key = 0xff, asc = 0, ascq = 0;
         if (rc == BOT_FAIL_PHASE_ERROR) {
-            /* The device has just been reset out of a desynchronised
-             * state; there is no completed command left for it to
-             * explain, so REQUEST SENSE would be meaningless (and is
-             * itself just another command to a device that has only
-             * just come back). Skip straight to the delayed retry: the
-             * attempt is counted like any other, so a drive that keeps
-             * phase-erroring still fails out rather than looping. */
+            /* The device was just reset: there is no completed command left
+             * for REQUEST SENSE to explain. The attempt still counts. */
             LOGW("token=%d: retrying after Reset Recovery (attempt %d/%d)",
                  token, attempt, LASER_MAX_RETRIES);
         } else if (csw_status == USB_BOT_STATUS_FAIL) {
@@ -1261,24 +911,10 @@ laser_status_t laser_scsi_cdb(int token,
             last_ascq = ascq;
         }
 
-        /* Disc gone or swapped: never retry, surface immediately so an
-         * ejection doesn't feel sluggish to the user.
-         *
-         * ALL qualifiers of 3Ah, deliberately - unlike
-         * laser_wait_until_ready(), which now splits them.
-         *
-         * The distinction that matters there is worthless here, and briefly
-         * making this branch match it was a mistake worth recording. That
-         * loop is trying to bring a drive up and can act on the difference:
-         * it sends START STOP UNIT and gives the drive a bounded window to
-         * change its mind. This path has already been through that window.
-         * By the time an ordinary command sees 3Ah, the wait has either
-         * succeeded - in which case a fresh 3Ah means the disc really did
-         * leave - or given up, in which case retrying six times per command
-         * only makes the same failure slower. Measured: a browse that failed
-         * in 155ms took tens of seconds and still failed.
-         *
-         * Fail fast, and let the wait be the only place that waits. */
+        /* Disc gone or swapped: never retried, so that an ejection is felt at
+         * once. Every 3Ah qualifier, unlike in the spin-up wait: that wait is
+         * the only place that waits, and it has already run, so a fresh 3Ah
+         * here means the disc really is gone. */
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
             LOGW("token=%d: no disc present (%02x/%02x/%02x), not retrying",
@@ -1294,33 +930,17 @@ laser_status_t laser_scsi_cdb(int token,
         }
         if (asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
             ascq == SCSI_ASCQ_FORMAT_LAYER_CHANGED) {
-            /* Dual-layer boundary, not an ejection: the disc is still
-             * there and the read that follows will normally succeed.
-             * Falls through to the ordinary delayed retry below rather
-             * than aborting playback - reporting MEDIA_GONE here would
-             * kill a DVD-9 the moment it crosses from layer 0 to layer
-             * 1, which on a feature film is somewhere around the middle
-             * of the movie. */
+            /* A dual-layer DVD crossing layers, around the middle of a film:
+             * the read that follows normally succeeds, so the ordinary
+             * delayed retry below applies. */
             LOGW("token=%d: format layer changed (dual-layer boundary), "
                  "retrying", token);
         }
 
-        /* Permanently refused: the drive parsed the command and will
-         * answer the same way every time. Retrying is not merely futile,
-         * it is actively harmful - six rounds of half-second delays per
-         * read, on a caller like libdvdcss that issues thousands of them,
-         * turns a clean error into what a user experiences as a hang. */
-        /* Copy-protection refusals, told apart before the generic case
-         * below swallows them.
-         *
-         * All three outcomes are permanent for THIS command - none is
-         * retried - but they mean different things to the caller, and the
-         * caller cannot recover the qualifier once this function has
-         * returned. Collapsing them into one status was costing two
-         * distinct bugs: a region mismatch reported to the user as an
-         * authentication problem, and - once CSS authentication exists - a
-         * momentarily lost session being recorded as a permanently
-         * unreadable sector. */
+        /* Copy-protection refusals, told apart before the generic refusal
+         * below swallows them. None is retried, but they mean different
+         * things to the caller, who cannot recover the qualifier once this
+         * function has returned. */
         if (sense_key == SCSI_SENSE_KEY_ILLEGAL_REQUEST &&
             asc == SCSI_ASC_COPY_PROTECTION) {
             switch (ascq) {
@@ -1359,6 +979,9 @@ laser_status_t laser_scsi_cdb(int token,
             break;
         }
 
+        /* Permanently refused: the drive will answer the same way every
+         * time, and six delayed retries per read would turn a clean error
+         * into what a user experiences as a hang. */
         if (sense_key == SCSI_SENSE_KEY_ILLEGAL_REQUEST ||
             sense_key == SCSI_SENSE_KEY_DATA_PROTECT) {
             LOGW("token=%d: cdb 0x%02x permanently refused "
@@ -1369,12 +992,9 @@ laser_status_t laser_scsi_cdb(int token,
             break;
         }
 
-        /* Transient conditions: UNIT ATTENTION clears itself by being
-         * reported, retry immediately with no delay. NOT READY/becoming
-         * ready needs an actual wait for the drive to spin up. Anything
-         * else (transport error, unexpected sense) falls through to the
-         * same delayed retry - cheap, and avoids hammering a
-         * momentarily confused drive. */
+        /* UNIT ATTENTION clears itself by being reported: retry at once.
+         * Anything else - not ready, a transport error, an unexpected sense -
+         * gets the delayed retry. */
         if (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION) {
             continue;
         }
@@ -1384,48 +1004,13 @@ laser_status_t laser_scsi_cdb(int token,
         }
     }
 
-    /* Normalise whatever the loop left behind into the public contract.
-     *
-     * A status that carries a specific meaning to the caller is preserved
-     * verbatim; everything else - the initial value, a transient
-     * condition that merely ran out of attempts, an internal BOT failure
-     * code - is reported as LASER_ERR_IO.
-     *
-     * THE LIST BELOW MUST GROW WITH EVERY NEW TERMINAL STATUS. A status
-     * missing from it is silently flattened into ERR_IO on the way out,
-     * with no compiler warning and no trace in the log, because the
-     * specific reason has usually already been printed by the branch that
-     * set it - so the log looks right while the caller receives something
-     * it cannot act on. That is precisely what happened to
-     * LASER_ERR_REFUSED when it was added: the refusal was detected,
-     * logged, and then turned back into an ordinary I/O error, leaving
-     * the stream layer unable to tell a permanently refused sector from a
-     * scratched one and looping on it forever. */
-    /* EVERY ATTEMPT FAILED BEFORE THE CBW LEFT: the device is gone, whatever
-     * libusb called it.
-     *
-     * LIBUSB_ERROR_NO_DEVICE is the answer the kernel gives for a device that
-     * has left the bus while its descriptor is still open. It is not the only
-     * answer available: a descriptor closed underneath the handle, or a
-     * controller that tears the URB down before it marks the device absent,
-     * both produce LIBUSB_ERROR_IO instead - and that is indistinguishable,
-     * one attempt at a time, from a bridge having a bad moment.
-     *
-     * The whole budget makes it distinguishable. A CBW is 31 bytes on a bulk
-     * endpoint; a device that will not take them once may be busy, but one
-     * that will not take them on any of LASER_MAX_RETRIES attempts spread
-     * over several seconds is not there. Concluding so costs nothing when the
-     * conclusion is wrong: the command has failed either way, and the only
-     * difference is whether the caller is told to stop or invited to try
-     * again on a drive that will not answer.
-     *
-     * Only when EVERY attempt failed that way. A single successful CBW
-     * anywhere in the budget proves the endpoint was alive, and the failure
-     * that followed belongs to the medium or the command.
-     *
-     * Never over a cancellation, which the loop above can break out on: the
-     * caller asked for this to stop, and telling it the hardware disappeared
-     * would answer a question it did not ask. */
+    /* Every attempt failed before the CBW left: the device is gone, whatever
+     * libusb called it. A descriptor closed under the handle, or a controller
+     * tearing the URB down before marking the device absent, gives
+     * LIBUSB_ERROR_IO rather than NO_DEVICE, which one attempt cannot tell
+     * from a bridge having a bad moment - but a device that will not take 31
+     * bytes on any of LASER_MAX_RETRIES attempts is not there. Never over a
+     * cancellation, which the caller asked for. */
     if (result != LASER_OK && result != LASER_ERR_CANCELLED &&
         attempts_made > 0 && cbw_never_sent == attempts_made) {
         LOGW("token=%d: cdb 0x%02x - the CBW could not be sent on any of "
@@ -1436,6 +1021,13 @@ laser_status_t laser_scsi_cdb(int token,
         reason_logged = 1;
     }
 
+    /* Normalise into the public contract: a status with a specific meaning
+     * to the caller is kept, everything else becomes LASER_ERR_IO.
+     *
+     * THIS LIST MUST GROW WITH EVERY NEW TERMINAL STATUS. One missing is
+     * silently flattened into LASER_ERR_IO while its own branch has already
+     * logged it correctly, so the log looks right while the caller gets
+     * something it cannot act on. */
     if (result != LASER_OK &&
         result != LASER_ERR_MEDIA_GONE &&
         result != LASER_ERR_NO_DEVICE &&
@@ -1444,9 +1036,7 @@ laser_status_t laser_scsi_cdb(int token,
         result != LASER_ERR_NO_KEY &&
         result != LASER_ERR_REGION &&
         result != LASER_ERR_CANCELLED) {
-        /* Only claim the full budget was spent when it actually was: the
-         * non-idempotent DATA-OUT path above breaks out on the first
-         * failure and has already logged its own, more specific reason. */
+        /* The non-idempotent path has logged its own reason. */
         if (idempotent && !reason_logged) {
             LOGW("token=%d: cdb 0x%02x failed after %d attempt(s) "
                  "(last sense %02x/%02x/%02x)",
@@ -1461,15 +1051,6 @@ laser_status_t laser_scsi_cdb(int token,
 }
 
 /* ============================================================================
- * Public: LBA-aware chunked block reads
- * ============================================================================ */
-
-/* Build the CDB for one chunk. The only thing the two public helpers below do
- * not have in common, which is why it is the only thing they pass in. */
-typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
-                                  const void *ctx);
-
-/* ============================================================================
  * DVD region (laser_region_mismatch)
  * ========================================================================= */
 
@@ -1479,13 +1060,11 @@ typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
  * drive agree exactly when their permitted sets intersect. */
 #define LASER_REGION_ALL        0xFF
 
-/* Byte 4 >> 6 of the RPC state. 0 means no region has been set yet, which is
- * not a mismatch: the drive will adopt the first disc's region by itself, and
- * that is the drive's decision to make, not ours to pre-empt with a warning. */
+/* Byte 4 >> 6 of the RPC state. 0: no region set yet, which is no mismatch -
+ * the drive adopts the first disc's region by itself. */
 #define LASER_RPC_TYPE_NONE     0x00
 
-/* Byte 6 of the RPC state. 0 is RPC-1: the drive enforces nothing and any
- * disc plays regardless of what its copyright structure says. */
+/* Byte 6 of the RPC state. 0 is RPC-1: the drive enforces nothing. */
 #define LASER_RPC_SCHEME_NONE   0x00
 
 /* REPORT KEY, key format 08h: the drive's RPC state.
@@ -1502,11 +1081,9 @@ static int report_rpc_state(int token, uint8_t *type, uint8_t *mask,
     cdb[0]  = 0xA4;                  /* REPORT KEY */
     cdb[8]  = sizeof(data) >> 8;     /* allocation length, big-endian */
     cdb[9]  = sizeof(data) & 0xFF;
-    cdb[10] = 0x08;                  /* key format: RPC state. The AGID bits
-                                      * of this byte are reserved for this
-                                      * format - the drive allocates nothing
-                                      * here - so it carries the format
-                                      * alone. */
+    cdb[10] = 0x08;                  /* key format: RPC state. No AGID for
+                                      * this format: the drive allocates
+                                      * nothing. */
 
     if (laser_scsi_cdb(token, cdb, sizeof(cdb), data, sizeof(data), 1,
                        &actual) != LASER_OK
@@ -1572,9 +1149,7 @@ int laser_region_mismatch(int token, uint8_t *drive_mask, uint8_t *disc_mask)
         return 0;
     }
 
-    /* Written only on the answer that makes them meaningful - see the
-     * contract in laser.h. A caller that ignores the return value and reads
-     * them anyway is asking about a comparison that did not happen. */
+    /* Written only on the answer that makes them meaningful - see laser.h. */
     if (drive_mask != NULL) {
         *drive_mask = dr_mask;
     }
@@ -1589,83 +1164,84 @@ int laser_region_mismatch(int token, uint8_t *drive_mask, uint8_t *disc_mask)
 
 int laser_status_is_positional(int status)
 {
-    /* Deliberately next to laser_scsi_cdb(), which is the only place any of
-     * these values is produced: whoever adds a status there has this list in
-     * the same file, and the contract explaining the split is on the
-     * declaration in laser.h. Splitting the two - the rule in one file, the
-     * classification in another - is what made a consumer's private copy
-     * drift in the first place. */
+    /* In the file that produces these values, so that whoever adds a status
+     * finds this list beside it. */
     switch (status) {
     case LASER_ERR_SCRAMBLED:
     case LASER_ERR_REGION:
     case LASER_ERR_REFUSED:
         return 1;
     default:
-        /* Includes every non-negative value: a block count is not a status,
-         * and answering "not positional" for it is the correct reading of a
-         * successful read. */
+        /* Including every non-negative value: a block count is a successful
+         * read, not a status. */
         return 0;
     }
 }
 
-/* Halve this device's transfer cap, if there is room left to halve.
- *
- * @return 1 if the cap actually shrank, 0 if it was already at the floor.
- */
-static int narrow_transfer_cap(laser_entry_t *entry)
+/* ============================================================================
+ * Public: LBA-aware chunked block reads
+ * ============================================================================ */
+
+/* Build the CDB for one chunk - the only thing the two public helpers below
+ * do differently. */
+typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
+                                  const void *ctx);
+
+/* Lower this device's transfer cap to @p bytes, if it is above that. Called
+ * once smaller transfers have read the whole range a @p failed_bytes one
+ * failed on. */
+static void lower_transfer_cap(laser_entry_t *entry, int bytes,
+                               int failed_bytes)
 {
     pthread_mutex_lock(&entry->io_lock);
 
-    int cap = entry->max_transfer_bytes;
-    if (cap <= LASER_MIN_BYTES_PER_TRANSFER) {
-        pthread_mutex_unlock(&entry->io_lock);
-        return 0;
+    const int lowered = bytes < entry->max_transfer_bytes;
+    if (lowered) {
+        entry->max_transfer_bytes = bytes;
     }
-
-    cap /= 2;
-    if (cap < LASER_MIN_BYTES_PER_TRANSFER) {
-        cap = LASER_MIN_BYTES_PER_TRANSFER;
-    }
-    entry->max_transfer_bytes = cap;
 
     pthread_mutex_unlock(&entry->io_lock);
 
-    LOG_QUIRK(entry, "transfer failed, limiting this device to %d bytes "
-                     "per command from now on", cap);
-    return 1;
+    if (lowered) {
+        LOG_QUIRK(entry, "a %d-byte transfer failed where %d-byte ones read "
+                         "the same blocks, limiting this device to %d bytes "
+                         "per command from now on",
+                  failed_bytes, bytes, bytes);
+    }
 }
 
-/* The body shared by laser_read_blocks() and laser_read_cd_blocks(): walks
- * @p num_blocks blocks from @p lba into @p buffer, one command per chunk
- * that fits the device's current transfer cap. The two callers differ only
- * in block size, CDB length and how a CDB is built, which is what
- * @p build_cdb and @p ctx carry in; everything else - the chunk arithmetic,
- * the buffer stride, the short-read accounting - is written once here.
+/* The body shared by laser_read_blocks() and laser_read_cd_blocks(): reads
+ * @p num_blocks blocks from @p lba into @p buffer, one command per chunk that
+ * fits the device's transfer cap.
  *
- * WHAT THE RETURN MEANS, which is the whole of the contract:
+ * Returns:
  *
- *   > 0  blocks actually read, contiguous from @p lba. MAY BE FEWER THAN
- *        ASKED: a short read is the ordinary answer for a scratched sector,
- *        and the shape the callers above are built for is "advance by what
- *        came back, ask for the rest".
- *   = 0  only when @p num_blocks was <= 0. A read that brought back no data
- *        is reported as LASER_ERR_IO rather than as a count, because that
- *        same caller shape makes no progress on 0 and would ask again
+ *   > 0  blocks read, contiguous from @p lba. May be fewer than asked: a
+ *        short read is the ordinary answer for a scratched sector, and
+ *        callers advance by what came back and ask for the rest.
+ *   = 0  only when @p num_blocks was <= 0. A read that brought back nothing
+ *        is LASER_ERR_IO, since 0 would make those callers ask again
  *        forever.
  *   < 0  a laser_status_t. Whatever is already in @p buffer must be
  *        ignored, including the chunks that succeeded.
  *
- * MEDIA_GONE, NO_DEVICE and CANCELLED are reported even when earlier chunks
- * succeeded, rather than being softened into a short read. The blocks ahead
- * are not merely unreadable this time round - there is nothing left to read
- * around, or nobody left asking - and a caller handed a short read would
- * keep walking a drive that can no longer answer. Every other failure
- * degrades to a short read once anything has been read at all.
+ * MEDIA_GONE, NO_DEVICE and CANCELLED are returned even after successful
+ * chunks: there is nothing left to read around, or nobody left asking, and a
+ * caller given a short read would keep walking a drive that cannot answer -
+ * dvdread and dvdnav treat a short read as an ordinary disc imperfection.
+ * Any other failure becomes a short read once something has been read.
  *
- * A plain I/O failure on a chunk of more than one block is retried against
- * a halved transfer cap before it counts as a failure: some bridges fail a
- * large data phase outright and carry the same request split smaller. The
- * loop says why that terminates.
+ * TRANSFER-SIZE NEGOTIATION. Some USB-ATAPI bridges fail a large data phase
+ * outright, where the same blocks read in smaller commands go through. So a
+ * plain I/O failure on more than LASER_MIN_BYTES_PER_TRANSFER is not final:
+ * the same blocks are read again at half the size, halving again on each
+ * failure. Only once the whole failed range has been read that way is the
+ * smaller size kept for the device: the large command failed on blocks that
+ * are readable, so the limit was the bridge's. A scratch inside the range
+ * fails the smaller reads too, and leaves the cap alone.
+ *
+ * This terminates: every retry is strictly smaller than the transfer that
+ * failed, and none goes below LASER_MIN_BYTES_PER_TRANSFER.
  *
  * @param token      registry token; the caller must hold a claim on it
  * @param lba        first block to read
@@ -1683,30 +1259,34 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
                         build_read_cdb_fn build_cdb, const void *ctx,
                         uint8_t *buffer, const char *what)
 {
-    /* Asking for nothing succeeds at reading nothing. Made explicit so that 0
-     * has exactly one meaning on the way out of the loop below - where it is
-     * an error - and exactly one here, where it is not. */
     if (num_blocks <= 0) {
         return 0;
     }
 
-    /* Needed for the per-device transfer cap below. A miss is not fatal here:
-     * laser_scsi_cdb() looks the token up again and reports NO_SUCH_TOKEN
-     * properly, so this only costs the negotiation. */
+    /* For the transfer cap. A miss costs only the negotiation:
+     * laser_scsi_cdb() looks the token up again and reports it. */
     laser_entry_t *entry = laser_lookup(token);
     int blocks_done = 0;
 
+    /* A negotiation in progress: trial_cap is the size being tried, 0 when
+     * there is none; trial_end is the block index where the failed range
+     * ends, and trial_failed the size that failed on it. */
+    int trial_cap = 0;
+    int trial_end = 0;
+    int trial_failed = 0;
+
     while (blocks_done < num_blocks) {
-        /* Re-read the cap every time round: another thread reading from the
-         * same drive may have narrowed it since the last chunk, and this is
-         * the only place it is consulted. */
+        /* Re-read every time round: another thread on the same drive may
+         * have lowered it. */
         int cap = entry != NULL ? entry->max_transfer_bytes
                                 : LASER_MAX_BYTES_PER_TRANSFER;
+        if (trial_cap > 0 && trial_cap < cap) {
+            cap = trial_cap;
+        }
+
         int max_blocks_per_chunk = cap / block_size;
         if (max_blocks_per_chunk < 1) {
-            /* A cap below one block would compute a chunk of zero and stall
-             * the loop. One block is the smallest thing that makes progress,
-             * so it is the floor whatever the cap says. */
+            /* One block is the smallest read that makes progress. */
             max_blocks_per_chunk = 1;
         }
 
@@ -1726,57 +1306,25 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
                 chunk * block_size, /* data_in = */ 1, &actual_len);
 
         if (st != LASER_OK) {
-            /* MEDIA_GONE is reported even when earlier chunks succeeded.
-             * Every other failure degrades to a short read (see below): that
-             * is the right call for a scratched sector, where the blocks
-             * already in `buffer` are real data the caller can use and read
-             * around. A disc ejected or swapped mid-read is categorically
-             * different - the remaining blocks are not merely unreadable
-             * right now, they will never be readable from this medium, and
-             * the ones already read may belong to a disc that is no longer in
-             * the drive. Collapsing that into a short read defeats the
-             * "surface this as a fatal, immediate error" contract documented
-             * on LASER_ERR_MEDIA_GONE in laser.h: dvdread/dvdnav treat a
-             * short read as an ordinary disc imperfection and keep going, so
-             * after an eject they would keep hammering a drive that can no
-             * longer answer.
-             *
-             * NO_DEVICE propagates for a stronger version of the same
-             * reason: there is no drive to read around, and a caller that
-             * treats it as a short read spends a dead command per block for
-             * as long as it cares to walk.
-             *
-             * CANCELLED propagates for the same reason and one more: the
-             * caller asked for it, so reporting progress instead would have
-             * it carry on around an interruption it requested itself.
-             *
-             * Partial data already written into `buffer` is left as-is and
-             * must be ignored by the caller on a negative return - same rule
-             * as every other error path here. */
             if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
                 st == LASER_ERR_CANCELLED) {
                 return (int)st;
             }
 
-            /* A plain I/O failure may be the BRIDGE rather than the disc.
-             * Some USB-ATAPI bridges cannot carry a full 64 KiB data phase
-             * and fail the whole command rather than returning a short one;
-             * the same request split smaller goes through. So before giving
-             * up, halve this device's cap and retry the SAME blocks - once
-             * per halving, three times at most between the ceiling and the
-             * floor, after which the failure is reported.
-             *
-             * THIS LOOP TERMINATES ON A LOCAL VARIANT: narrow_transfer_cap()
-             * returns 0 once the floor is reached, and every retry strictly
-             * decreases a value bounded below, so the number of retries per
-             * chunk is bounded by log2(MAX/MIN) whatever any other thread is
-             * doing.
-             *
-             * Retried only when the chunk is larger than one block: at one
-             * block there is nothing left to split and the failure is about
-             * the medium. */
+            /* Maybe the bridge rather than the disc: try the same blocks at
+             * half the size. The first failure of a negotiation sets the
+             * range it must cover. */
+            const int tried = chunk * block_size;
             if (st == LASER_ERR_IO && chunk > 1 && entry != NULL &&
-                narrow_transfer_cap(entry)) {
+                tried > LASER_MIN_BYTES_PER_TRANSFER) {
+                if (trial_cap == 0) {
+                    trial_end = blocks_done + chunk;
+                    trial_failed = tried;
+                }
+                trial_cap = tried / 2;
+                if (trial_cap < LASER_MIN_BYTES_PER_TRANSFER) {
+                    trial_cap = LASER_MIN_BYTES_PER_TRANSFER;
+                }
                 continue;
             }
 
@@ -1784,27 +1332,15 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
         }
 
         if (actual_len != chunk * block_size) {
-            /* Short read: return what we got so far rather than treating it
-             * as a hard failure - matches the tolerance dvdread/dvdnav expect
-             * from a real block device on an imperfect disc.
-             *
-             * Unless nothing at all came back. Zero is not a short read, it
-             * is a failed one, and returning it as a count invites the caller
-             * into an infinite loop: the natural shape of a block-read caller
-             * is "advance by what was read, ask for the rest", which makes no
-             * progress on 0 and asks again forever. A negative status makes
-             * it terminate. */
+            /* Short read: what was read so far, as a real block device
+             * returns on an imperfect disc - unless that is nothing, see the
+             * contract above. */
             int short_total = blocks_done + actual_len / block_size;
             if (short_total == 0) {
-                /* Both lengths named, because the interesting failure is the
-                 * one where they are close. A whole sector short of the
-                 * request is a scratch; a couple of hundred bytes short is a
-                 * drive returning a SMALLER SECTOR than the one asked for -
-                 * 2072 rather than 2352, a raw Mode 2 Form 1 sector, which
-                 * LASER_CD_SECTOR_ANY can legitimately encounter and which
-                 * this strict check then rejects as unreadable. Nothing
-                 * observed does this, and the numbers in this line are what
-                 * would say so at a glance if something did. */
+                /* Both lengths are logged: a few hundred bytes short would be
+                 * a drive returning a smaller sector than asked - 2072 rather
+                 * than 2352, a raw Mode 2 Form 1 sector without its EDC/ECC -
+                 * not a scratch. */
                 LOGW("token=%d: read of %d %s at LBA %u returned no usable "
                      "data (%d of %d bytes)",
                      token, num_blocks, what, lba, actual_len,
@@ -1815,6 +1351,11 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
         }
 
         blocks_done += chunk;
+
+        if (trial_cap > 0 && blocks_done >= trial_end) {
+            lower_transfer_cap(entry, trial_cap, trial_failed);
+            trial_cap = 0;
+        }
     }
 
     return blocks_done;
@@ -1868,71 +1409,35 @@ static void build_read_cd_cdb(uint8_t *cdb, uint32_t lba, int blocks,
 int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
                          laser_cd_sector_t sector_type, uint8_t *buffer)
 {
-    /* The same for both sector kinds, which is what lets everything below
-     * this line stay indifferent to which one was asked for - the chunk
-     * arithmetic, the buffer stride and the short-read accounting are all
-     * written once. See laser_cd_sector_t in laser.h for why the two kinds
-     * agree on this number by different arithmetic. */
+    /* The same for every sector kind - see laser_cd_sector_t in laser.h. */
     const int block_size = 2352;
 
-    /* The whole of the difference: byte 1 of the CDB says what the drive
-     * should expect to find, byte 9 says which parts of it to send back.
-     * Resolved once, here, rather than inside the loop, so that the CDB
-     * construction below reads the same for either kind and there is one
-     * place to look when a third kind is added.
+    /* Byte 1 of the CDB says what the drive should expect to find, byte 9
+     * which fields to send back.
      *
-     *   AUDIO: Expected Sector Type = CD-DA (001b), User Data alone.
-     *     The obvious-looking alternative - sector type "any" with every
-     *     flag set (0xF8: Sync + Header + Sub-header + User Data + EDC/ECC)
-     *     - asks for structures a CD-DA sector does not have. An audio
-     *     sector has no sync pattern, no header and no EDC/ECC; its 2352
-     *     bytes ARE the user data. MMC's own byte-count table defines only
-     *     User Data for this sector type, and a drive is entitled to answer
-     *     a request for the others with ILLEGAL REQUEST / INVALID FIELD IN
-     *     CDB. Some do, some quietly ignore the extra bits and return the
-     *     same 2352 bytes - which is why the wrong form works on part of the
-     *     hardware and fails on the rest, and why this is the form CD-DA
-     *     extractors have converged on.
+     *   AUDIO: Expected Sector Type CD-DA (001b), User Data only. A CD-DA
+     *     sector has no sync, header or EDC/ECC - its 2352 bytes are the
+     *     user data - and a drive may refuse a request for them with INVALID
+     *     FIELD IN CDB, as some do. This is the form CD-DA extractors use. If
+     *     a drive ever refuses it, try type "any" (0x00) with User Data only
+     *     (0x10).
      *
-     *     If a drive is ever found that rejects THIS form, the fallback to
-     *     try is sector type "any" (byte 1 = 0x00) with User Data alone
-     *     (byte 9 = 0x10) - not the return of the EDC/ECC bits.
+     *   MODE2_FORM2 and ANY: sync, headers, user data and EDC/ECC (0xF8),
+     *     which a Mode 2 sector does have; they differ only in the expected
+     *     type, Form 2 (101b) or "all types" (000b).
      *
-     *   MODE2_FORM2 and ANY: Sync, both Header Codes, User Data AND EDC/ECC
-     *     (0xF8). They differ only in Expected Sector Type - Mode 2 Form 2
-     *     (101b) where the caller can declare the form, "all types" (000b)
-     *     where it cannot.
-     *
-     *     THE AUDIO REASONING DOES NOT TRANSFER, and that is why the flags
-     *     differ rather than being shared: a Mode 2 Form 2 sector really
-     *     does carry a sync pattern, a header, a sub-header and an EDC, so
-     *     asking for them is asking for structures that exist.
-     *
-     *     0xF8 RATHER THAN 0xF0, AND THE FOUR BYTES MATTER EVEN THOUGH NO
-     *     CALLER READS THEM. This was 0xF0 - what VLC's own BSD arm has
-     *     shipped for years - with a note that the thing to verify on real
-     *     hardware was whether a drive counts the trailing EDC into its
-     *     transfer length regardless. Two did not:
+     *     0xF8 rather than 0xF0, for the LENGTH of the EDC, which no caller
+     *     reads:
      *
      *         0xF0, Mode 2 Form 1:  12 + 4 + 8 + 2048        = 2072
      *         0xF0, Mode 2 Form 2:  12 + 4 + 8 + 2324        = 2348
      *         0xF8, Mode 2 Form 1:  12 + 4 + 8 + 2048 + 280  = 2352
      *         0xF8, Mode 2 Form 2:  12 + 4 + 8 + 2324 + 4    = 2352
      *
-     *     Under 0xF0 neither form is 2352, so the block_size above was a
-     *     fiction that only held on bridges which pad the transfer and
-     *     declare the difference as residue. On one that reports honestly a
-     *     Form 1 sector came back as "2072 of 2352 bytes" and failed the
-     *     strict length check; worse, a MULTI-SECTOR payload read packs
-     *     sectors at 2348 while every caller indexes at 2352, so sector n is
-     *     misread by 4n bytes and the MPEG stream desynchronises after the
-     *     first one. That is silent, and it is why a Video CD's entry points
-     *     could parse while no demuxer would accept the payload.
-     *
-     *     0xF8 makes BOTH forms exactly 2352, which is what block_size above
-     *     asserts, what cdrom.c strides by, and what laser_cd_sector_t
-     *     promises. The EDC bytes are discarded by every caller - they are
-     *     requested for their LENGTH, not their content. */
+     *     Only 0xF8 makes both forms 2352 bytes, the stride cdrom.c reads
+     *     with. Under 0xF0, a bridge reporting lengths honestly packs Form 2
+     *     sectors at 2348, misplacing sector n by 4n bytes and desynchronising
+     *     the MPEG stream. */
     uint8_t expected_type;
     uint8_t field_flags;
 
@@ -1948,19 +1453,13 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
             break;
 
         case LASER_CD_SECTOR_ANY:
-            /* Expected Sector Type 000b: read what is there, check nothing.
-             * Same field flags as above, and that is the point - 0xF8 yields
-             * 2352 bytes for Form 1 and Form 2 alike, so "whichever form is
-             * there" costs the caller no ambiguity about the stride. */
             expected_type = 0x00;
             field_flags   = 0xF8;
             break;
 
         default:
-            /* Rejected before the device is touched, on the same grounds as
-             * laser_scsi_cdb()'s argument validation: this is a caller bug,
-             * and forwarding it would surface as an ILLEGAL REQUEST from the
-             * drive - an answer that names the CDB and not the mistake. */
+            /* A caller bug, rejected before the device is touched, as in
+             * laser_scsi_cdb(). */
             LOGE("token=%d: laser_read_cd_blocks: unknown sector type %d",
                  token, (int)sector_type);
             return (int)LASER_ERR_INVALID;

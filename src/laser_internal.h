@@ -1,11 +1,11 @@
 /*****************************************************************************
- * laser_internal.h: private, shared between registry.c and
- * usb.c, bot.c and scsi.c only. Never included by callers of laser.h.
+ * laser_internal.h: private to liblaser's own sources, never included by
+ * callers of laser.h.
  *****************************************************************************
  * Copyright (C) 2026 Authors
  *
  * Authors: Pierre Bogdanovscky
- * Co-authored-by: claude-code:claude-opus-5-0
+ * Co-authored-by: claude-code:claude-opus-5-5
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -20,13 +20,13 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this library; if not, write to the Free Software Foundation,
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
- *****************************************************************************
  *****************************************************************************/
 
 #ifndef LASER_INTERNAL_H
 #define LASER_INTERNAL_H
 
 #include <stdint.h>
+#include <sys/types.h>
 #include <pthread.h>
 #include <libusb.h>
 
@@ -34,17 +34,10 @@
 #include "laser.h"
 
 /* ---------------------------------------------------------------------------
- * Logging, defined once here rather than twice in the .c files.
+ * Logging, routed through laser_log() to the sink laser_set_log_cb() set.
  *
- * registry.c and the transport files each carried their own copy of these three
- * macros, identical apart from a comment, which is how the two drifted into
- * disagreeing about what LOGE meant. They also went straight to the
- * platform's log, which is what laser_set_log_cb() exists to make optional -
- * so the destination has to be resolved in one place anyway.
- *
- * LOGE is for programming errors on this library's own API - a caller
- * violating the contract in laser.h - and for conditions that indicate a bug
- * upstream, such as an unbalanced release. LOGW is the hardware misbehaving.
+ * LOGE is for a caller violating the contract of laser.h, or for a bug
+ * upstream such as an unbalanced release. LOGW is the hardware misbehaving.
  * ------------------------------------------------------------------------- */
 void laser_log(laser_log_level_t level, const char *fmt, ...)
 #ifdef __GNUC__
@@ -56,216 +49,116 @@ void laser_log(laser_log_level_t level, const char *fmt, ...)
 #define LOGW(...) laser_log(LASER_LOG_WARN,  __VA_ARGS__)
 #define LOGE(...) laser_log(LASER_LOG_ERROR, __VA_ARGS__)
 
-/* For the handful of conditions that mean "this device is not following the
- * Bulk-Only spec". These are logged with the device's USB identity rather
- * than just its fd, and under a distinct "QUIRK?" marker, for one reason:
- * they are the observations that would justify a per-device workaround
- * later. Without the identity a user's logcat says something is wrong but
- * not what to key a workaround on; without the marker the lines are lost
- * among ordinary I/O warnings. Grepping "QUIRK?" out of a bug report should
- * be enough to tell whether a given drive is misbehaving in a known way.
- *
- * Deliberately not a mechanism - there is no quirk table behind this, and no
- * device is treated differently because of it. It only makes the evidence
- * collectable, which is the step that has to come first.
- *
- * Here rather than in one .c file because both bot.c and scsi.c raise them,
- * which is the same reason LOGI/LOGW/LOGE moved here. */
+/* For a device not following the Bulk-Only specification: logged with its USB
+ * identity, the key a per-device workaround would match on, and under a
+ * "QUIRK?" marker that can be grepped out of a bug report. No device is
+ * treated differently because of it; it only collects the evidence. */
 #define LOG_QUIRK(entry, fmt, ...) \
     LOGW("QUIRK? usb %04x:%04x bcd %04x: " fmt, \
          (entry)->vid, (entry)->pid, (entry)->bcd_device, \
          ##__VA_ARGS__)
 
-/** Small, fixed upper bound on concurrently registered devices. In
- * practice there is realistically at most one or two optical drives
- * attached at once; a fixed-size table keeps the registry allocation-free
- * and trivially safe to reason about, at the cost of this arbitrary cap. */
+/** Fixed bound on concurrently registered devices, keeping the registry
+ * allocation-free. One or two optical drives is the realistic case. */
 #define LASER_MAX_DEVICES 8
 
-/* Safe upper bound on the data phase of a single BOT transaction, and the
- * starting value of laser_entry_t::max_transfer_bytes. Well under the SCSI
- * READ(10) 16-bit block-count field's own limit (65535 blocks) - this cap
- * exists to stay comfortably inside USB bulk transfer sizes that are reliable
- * in practice across Android USB host controller implementations, not because
- * of a SCSI-level limit. */
+/* Upper bound on the data phase of one BOT transaction, and the starting
+ * value of laser_entry_t::max_transfer_bytes. Set by what USB bulk transfers
+ * carry reliably across Android host controllers, far below READ(10)'s own
+ * limit. */
 #define LASER_MAX_BYTES_PER_TRANSFER  (64 * 1024)
 
-/* Floor for the per-device negotiation. Below this the per-command overhead
- * dominates so heavily that there is nothing left to save, and a bridge that
- * cannot manage 8 KiB in one command has a problem no tuning will fix.
- *
- * Chunk sizing floors at ONE BLOCK independently of this, which matters for
- * READ CD: 8192 / 2352 is three sectors, and a cap set below one block would
- * otherwise compute a chunk of zero and make the read loop stand still. */
+/* Floor of the per-device negotiation: below it, per-command overhead
+ * dominates, and a bridge that cannot carry 8 KiB in one command has a
+ * problem no tuning will fix. Chunks never go below one block whatever the
+ * cap, which matters for READ CD, where this is only three sectors. */
 #define LASER_MIN_BYTES_PER_TRANSFER  (8 * 1024)
 
-/** USB Mass Storage Bulk-Only Transport (BOT) - see bot.c for the
- * protocol implementation itself; this header only needs the shape of
- * the per-device state bot.c and scsi.c operate on. */
+/** Per-device state for USB Mass Storage Bulk-Only Transport (BOT); the
+ * protocol itself is in bot.c. */
 typedef struct {
-    /* Is this slot a live, fully set-up registration?
-     *
-     * ONE FLAG IS ENOUGH because of WHEN it is written. Registration happens
-     * only inside laser_acquire(), under g_registry_lock, and this field is
-     * written LAST - so a slot under construction is not in the table at all.
-     * Publishing it earlier would need a second flag beside it: the USB setup
-     * is slow (control transfers, a Mass Storage Reset with its settle sleep,
-     * a spin-up wait that can legally take ten seconds), and throughout that
-     * window the entry would match on token with a NULL handle.
-     *
-     * Only a lock holder ever writes a free slot, and there is only ever one
-     * at a time, so two threads cannot reserve the same fd either.
+    /* Is this slot a live, fully set-up registration? Written last by
+     * laser_register(), so a slot under construction - which lasts seconds -
+     * is never found by laser_lookup().
      *
      * Written under g_registry_lock, read under g_table_lock. */
     int in_use;
     int token;
 
-    /* How many consumers have called laser_acquire() and not yet released.
-     * Teardown happens when this reaches zero and not before - see
-     * laser_release()'s contract in laser.h.
+    /* Claims held through laser_acquire() and not yet released. A device is
+     * registered only with a claim, so this is 1 when the entry becomes
+     * visible, and teardown happens when it falls back to 0.
      *
-     * EVERY REGISTRATION HAS A CLAIM BEHIND IT. A device is registered by
-     * laser_acquire() and by nothing else, so refs is 1 the moment the entry
-     * becomes visible, and an entry with refs == 0 does not exist. One that
-     * did would be indestructible, since teardown only ever happens on the
-     * 1 -> 0 transition.
-     *
-     * Written and read under g_registry_lock, which is also what makes
-     * "register, then count" a single atomic step. */
+     * Written and read under g_registry_lock. */
     int refs;
 
-    /* Largest transfer, in BYTES, this device has been shown to tolerate.
+    /* Largest transfer, in BYTES, this device carries: 2048-byte READ(10)
+     * blocks and 2352-byte READ CD sectors alike, and bytes are what a bridge
+     * reacts to.
      *
-     * Starts at LASER_MAX_BYTES_PER_TRANSFER and only ever shrinks, halving
-     * each time a chunked read comes back LASER_ERR_IO, with a floor at
-     * LASER_MIN_BYTES_PER_TRANSFER. A bridge that cannot manage the full 64
-     * KiB in one command is a property OF THE BRIDGE, so it belongs here
-     * rather than in a consumer: negotiated in one module it would leave the
-     * others - CD-DA and VCD reach the drive through cdrom.c and
-     * laser_read_cd_blocks() - failing on hardware the first had tamed.
+     * Starts at LASER_MAX_BYTES_PER_TRANSFER and only ever shrinks, never
+     * below LASER_MIN_BYTES_PER_TRANSFER: lowered when smaller transfers read
+     * the whole range a larger one failed on, which shows the limit to be the
+     * bridge's rather than the disc's (see read_chunked() in scsi.c). Kept
+     * here rather than in a consumer, so that every consumer of the token
+     * benefits.
      *
-     * IN BYTES, NOT BLOCKS, because that is the quantity the bridge reacts
-     * to and because it has to serve both block sizes: 2048 for READ(10),
-     * 2352 for READ CD. Expressed in blocks it would mean different things
-     * to the two callers.
-     *
-     * Written under io_lock (see narrow_transfer_cap in scsi.c), read
-     * without it when sizing a chunk. That read is a benign race by
-     * construction: the value only ever decreases, so a stale read asks for
-     * slightly too much and is corrected on the spot by the same mechanism
-     * that shrank it. */
+     * Written under io_lock, read without it when sizing a chunk: a stale
+     * read asks for too much once and fails over to the same negotiation. */
     int max_transfer_bytes;
 
-    /* Set by the laser_release() that takes refs to zero, immediately before
-     * teardown, and never cleared - the slot is memset moments later, so a
-     * fresh claim on the same fd starts clean.
+    /* Raised by the laser_release() that drops the last claim, just before
+     * teardown, and never cleared; the slot is memset afterwards. An
+     * operation still running on another thread sees it between retry
+     * attempts and between chunks, and gives up.
      *
-     * WHAT IT IS FOR, now that nothing outside the library sets it. The
-     * public contract says no transaction may be in flight on a token when
-     * its last claim is dropped, and nothing here can enforce that: another
-     * thread legitimately obtained its entry pointer before teardown began.
-     * Raising the flag first gives such a thread the chance to abandon its
-     * remaining attempts rather than run out a six-attempt budget against a
-     * handle that is about to close.
-     *
-     * Read WITHOUT any lock, from inside the retry loop and the chunk loops.
-     * That is a benign race by construction: the only transition is 0 -> 1,
-     * so a reader that misses it loses one more attempt and sees it on the
-     * next. Making it a lock acquisition per attempt would put a registry
-     * lock on the transaction path, which is the one thing those locks are
-     * designed never to be on. */
+     * Read without any lock, on the transaction path: it only goes from 0 to
+     * 1, so a reader that misses it sees it one attempt later. */
     int cancelled;
 
-    /* Latched once this device has been shown to have left the bus, so that
-     * every later command on the token fails without touching libusb.
+    /* Latched once the device is shown to have left the bus, so that every
+     * later command on the token fails at once instead of spending a retry
+     * budget - about two and a half seconds - to learn the same thing.
+     * Terminal: a device back on the bus comes with a new fd, hence a new
+     * registration.
      *
-     * WHAT IT SAVES. Establishing that a device is gone is expensive: on a
-     * bridge whose descriptor no longer answers, it takes the whole retry
-     * budget - six attempts and the delays between them, around two and a
-     * half seconds - to conclude what the previous command concluded already.
-     * A caller that reads sector by sector pays that per sector: an audio CD
-     * demuxer willing to skip sixteen bad reads before giving up spends forty
-     * seconds doing so, and none of it tells anyone anything new.
-     *
-     * TERMINAL FOR THIS REGISTRATION, which is what makes latching it sound.
-     * Unlike a missing medium, which comes back when a disc is inserted, a
-     * device that has left the bus does not come back on this token at all -
-     * it returns as a new descriptor, hence a new registration, hence a fresh
-     * entry with this flag clear.
-     *
-     * Read WITHOUT any lock, on the same terms as `cancelled` above: the only
-     * transition is 0 -> 1, so a reader that misses it pays one more command
-     * and sees it on the next. */
+     * Read without any lock, on the same terms as `cancelled`. */
     int device_gone;
 
-    /* Identity of the descriptor this entry was registered on, as reported by
-     * fstat() at registration.
-     *
-     * WHAT IT DETECTS: a descriptor number reused by the operating system for
-     * something else while an entry still refers to it. That can only happen
-     * when a claim was never released, which is a lifecycle bug upstream - but
-     * the consequence of not noticing is worse than the bug: commands go to a
-     * handle wrapping whatever the number now names.
-     *
-     * A HEURISTIC, not a guarantee. usbfs allocates inode numbers and may
-     * reuse one after its node is destroyed, so a match is strong evidence
-     * and not proof. It is no substitute for releasing claims. */
+    /* Identity of the descriptor at registration, from fstat(), so that
+     * laser_acquire() can refuse an fd number the system has recycled while
+     * an entry still refers to it - which only a claim never released allows.
+     * Zero when fstat() failed. A heuristic: usbfs may reuse inode numbers. */
     dev_t reg_dev;
     ino_t reg_ino;
 
-    /* Dedicated libusb context for this device - deliberately NOT the
-     * shared default (NULL) context. A playback session can be open for
-     * hours, with reads driven directly by libVLC's own internal
-     * threads; it must not share init/exit lifecycle or event handling
-     * with a detection scan that might run concurrently on a different
-     * device. See the registry section's doc comment in the public
-     * header for the full rationale. */
+    /* Dedicated libusb context, never the shared default one: a playback
+     * session lasting hours must not share libusb state with a detection
+     * scan on another device. */
     libusb_context *ctx;
     libusb_device_handle *handle;
 
-    /* The interface number this device's Bulk-Only function actually
-     * lives on, resolved from the configuration descriptor by
-     * laser_find_bulk_endpoints(). NOT assumed to be 0: interface 0
-     * is whatever the device chose to list first, which on a drive with a
-     * front-panel HID or a second function is not the mass-storage one.
-     *
-     * Claim, release, Mass Storage Reset and GET MAX LUN must all name
-     * this same number - naming a different one than the endpoints belong
-     * to is the failure this field exists to make impossible. */
+    /* The interface carrying the Bulk-Only function, as chosen by
+     * laser_find_bulk_endpoints() - not assumed to be 0. Claim, release, Mass
+     * Storage Reset and GET MAX LUN all address this one. */
     uint8_t iface_num;
 
     unsigned char ep_in;
     unsigned char ep_out;
 
-    /* wMaxPacketSize of the bulk pair, recorded by
-     * laser_find_bulk_endpoints() so the throughput check in scsi.c knows
-     * what the link is supposed to be capable of.
-     *
-     * Read off the descriptor rather than from libusb_get_device_speed(),
-     * which answers out of sysfs and reports LIBUSB_SPEED_UNKNOWN on kernels
-     * that do not fill it in - observed on the very devices most likely to
-     * need the check. 64 is full speed, 512 high speed, 1024 SuperSpeed. */
+    /* wMaxPacketSize of the bulk pair: 64 at full speed, 512 at high speed,
+     * 1024 at SuperSpeed. Read off the descriptor, since
+     * libusb_get_device_speed() reports UNKNOWN on some kernels. Used by the
+     * throughput check in scsi.c. */
     uint16_t ep_max_packet;
 
-    /* Set when laser_register() successfully detached the kernel driver, so
-     * the unwind ladder knows whether it has one to give back. Not simply
-     * "was a driver attached": only a detach WE performed may be undone, and
-     * only on a path that gives the device up. */
+    /* Set when laser_register() detached the kernel driver itself, so that a
+     * path giving the device up knows whether there is one to give back. */
     int kernel_driver_detached;
 
-    /* Sustained-throughput sampling, for the one failure mode that produces
-     * no error of any kind: a drive with too little power.
-     *
-     * Such a drive enumerates, negotiates full link speed, answers every
-     * command correctly and reads at a fraction of what the link can carry.
-     * Nothing in this library sees an error, because there is not one -
-     * every command succeeds, slowly. It was diagnosed once by measuring
-     * from outside, and cost several wrong theories on the way; these three
-     * fields exist so the next occurrence names itself.
-     *
-     * Written under io_lock in laser_scsi_cdb(), which is the only place a
-     * data transfer is timed. slow_warned latches so the warning is said
-     * once per registration and never becomes noise. */
+    /* Sustained read throughput, sampled for the one failure that raises no
+     * error: an underpowered drive that answers every command correctly,
+     * slowly. Written under io_lock; slow_warned latches the single report. */
     uint64_t xfer_bytes;
     uint64_t xfer_us;
     uint64_t xfer_count;
@@ -273,214 +166,135 @@ typedef struct {
 
     uint32_t tag;
 
-    /* USB identity of this device, read once at registration from the
-     * device descriptor libusb already has cached (so it costs nothing).
-     * Kept purely so that every subsequent log line can name the
-     * hardware: an fd is meaningless in a bug report, whereas
-     * vid:pid:bcd is exactly the tuple a per-device workaround would key
-     * on, and the tuple a user can be asked to send back. */
+    /* USB identity, read at registration from the cached device descriptor,
+     * so that log lines name the hardware rather than an fd. */
     uint16_t vid;
     uint16_t pid;
     uint16_t bcd_device;
 
-    /* Set once the residue-versus-wire-count contradiction has been
-     * reported for this device, so it is logged once per session
-     * instead of once per transfer. On a bridge that always gets the
-     * residue wrong the condition holds for every chunk of every read -
-     * tens of thousands of times over one film - and a warning repeated
-     * that often buries every other log line and stops being read at
-     * all. One occurrence carries the same information for a bug
-     * report. */
+    /* Set once a residue contradicting a full transfer has been logged, so
+     * that a bridge that always gets it wrong is reported once, not on every
+     * read. */
     int residue_quirk_logged;
 
-    /** Nonzero while a probe is in flight: shortens the BOT phase timeouts.
-     *
-     * Set and cleared around the command, under io_lock, by whoever issues
-     * it. A probe is a command that needs no medium and that a working device
-     * answers at once - INQUIRY today. The read timeouts are sized for a
-     * drive that seeks or spins up; a probe inheriting them costs seconds to
-     * establish that a device is not answering. */
+    /** Nonzero while a probe - a command needing no medium, INQUIRY today -
+     * is in flight: shortens the BOT phase timeouts. Set and cleared around
+     * the command, under io_lock. */
     int probe_timeouts;
 
-    /* Logical Unit Number to address in every CBW for this device.
-     * Almost always 0, but not always: a device may expose several LUNs
-     * behind one Bulk-Only interface, and combo drives that pair an
-     * optical drive with an SD/microSD card reader in the same enclosure
-     * do exactly that - with no guarantee the optical unit is LUN 0. On
-     * such a drive, hardcoding 0 sends every command to the card reader,
-     * so the disc is never found and the device looks like it simply
-     * isn't an optical drive at all. Resolved once at registration by
-     * laser_probe_lun(). */
+    /* Logical Unit to address in every CBW. Almost always 0, but a combo
+     * enclosure may put its card reader there and the optical drive on
+     * another unit. Chosen at registration by laser_probe_lun(). */
     uint8_t lun;
 
-    /* NOTE: there is deliberately no "last CSW status" field here. The
-     * raw bCSWStatus of a command is passed back through an
-     * out-parameter of bot.c's laser_bot_send_locked() instead,
-     * so that each caller keeps its own copy on the stack. Storing it on
-     * the device would make it shared mutable state with a lifetime far
-     * longer than its meaning: it is only valid between issuing a
-     * command and inspecting that command's outcome, and the natural
-     * response to a FAIL - sending REQUEST SENSE to find out why - is
-     * itself a BOT transaction that would overwrite it before the
-     * original caller had finished with it. */
+    /* There is deliberately no "last CSW status" field: the status is passed
+     * back through laser_bot_send_locked()'s out-parameter, since the
+     * REQUEST SENSE that follows a failure would overwrite a shared copy. */
 
-    /* Serializes every BOT transaction on this device: the protocol is
-     * stateful (one CBW, its data phase, then its CSW - strictly in
-     * order, never interleaved with another command), so at most one
-     * thread may be mid-transaction on a given device at any time. Held
-     * for the full duration of laser_scsi_cdb(), including its
-     * internal retries. */
+    /* Serializes BOT transactions on this device - one CBW, its data phase,
+     * its CSW, never interleaved - for the whole of laser_scsi_cdb(),
+     * retries included. */
     pthread_mutex_t io_lock;
 
-    /* CSS authentication session: mutual exclusion between CONSUMERS, one
-     * layer above io_lock, and the reason both exist.
+    /* CSS authentication session: exclusion between CONSUMERS, one level
+     * above io_lock.
      *
-     * io_lock protects a TRANSACTION - one CBW, its data phase, its CSW. The
-     * right unit for reads, where each command is complete in itself.
+     * Authentication is a sequence whose state lives in the drive between
+     * transactions - AGID, challenges, keys. io_lock serializes each step and
+     * protects nothing between them: another consumer's AGID request in a gap
+     * takes one of the drive's four AGIDs and may invalidate ours. Observed
+     * with the media library's preparser opening the same disc on its own
+     * thread.
      *
-     * CSS authentication is a SEQUENCE whose state lives in the drive BETWEEN
-     * transactions: AGID, host challenge, key1, drive challenge, key2, ASF.
-     * io_lock serializes each step perfectly and protects none of what joins
-     * them. A second consumer requesting an AGID in the gap between two of our
-     * steps gets its own clean transaction, consumes one of the drive's four
-     * AGIDs, and may invalidate ours - every lock acquisition correct, result
-     * wrong. Observed in the field: the medialibrary preparser fetching
-     * "laser/dvd://<fd>" on its own thread, interleaved between two
-     * commands of a probe on the same token.
-     *
-     * NOT A pthread_mutex, and NOT OWNED BY A THREAD. A libdvdcss instance
-     * opens its session when the handle is created and closes it when the
-     * handle is destroyed; in between, its key commands are issued from
-     * whichever thread libVLC happens to be reading on - dvdcss_disckey() runs
-     * on the demux open thread, dvdcss_titlekey() later on the playback
-     * thread. A pthread mutex must be released by the thread that took it and
-     * would refuse the second thread its own session, so ownership is an
-     * opaque cookie (the dvdcss_t) and the wait is a condition variable. */
+     * Owned by an opaque cookie (the dvdcss_t), not by a thread: a libdvdcss
+     * instance issues key commands from several threads over its life, and a
+     * pthread mutex must be unlocked by the thread that locked it. */
     pthread_mutex_t css_mtx;
     pthread_cond_t  css_cv;
     int             css_open;
     const void     *css_owner;
 
-    /* Set while laser_wait_until_ready() is running and cleared the moment
-     * the unit answers ready, so it survives only on an entry whose wait ran
-     * out - a drive that spent its whole budget saying "not yet", or one with
-     * an open tray. Registration still succeeds: a drive that never reported
-     * ready can still read, and refusing it here would stop it trying. What
-     * reads it is laser_disc_identify(), which would otherwise spend a second
-     * budget per command rediscovering the same answer. */
+    /* Raised during laser_wait_until_ready() and cleared when the unit
+     * answers ready, so it remains set only on a drive whose wait ran out.
+     * Registration succeeds either way; laser_disc_identify() reads it to
+     * skip probes that would each spend a retry budget for nothing. */
     int             not_ready;
 } laser_entry_t;
 
 /**
- * Look up the entry for a token. Returns NULL if the token is not
- * registered - which now means exactly one thing, since a device is
- * registered by laser_acquire() and by nothing else, and a slot under
- * construction is not in the table at all: there is no "registered but not
- * usable yet" state for this to hide.
+ * Look up the entry for a token, or NULL if it is not registered.
  *
- * The returned pointer is stable for the lifetime of the registration
- * (entries live in a fixed table, never moved or reallocated) - callers in
- * scsi.c may hold onto it across the whole duration of a transaction without
- * re-looking it up, as long as they do not race with the laser_release()
- * that drops the last claim on the same token (see that function's
- * threading contract in the public header).
+ * The pointer stays valid for the life of the registration - entries live in
+ * a fixed table - so scsi.c holds it across a whole transaction, provided the
+ * caller does not race with the laser_release() dropping the last claim (see
+ * laser.h).
  *
- * THE ONLY WAY IN, for everything except laser_acquire(). A command on a
- * token nobody has claimed is a caller-lifecycle bug, and it now says so
- * immediately instead of quietly registering a device that no consumer will
- * ever release.
+ * The only way in, apart from laser_acquire(): a command on an unclaimed token
+ * is a caller bug, reported as such rather than registering a device nobody
+ * will release.
  */
 laser_entry_t *laser_lookup(int token);
 
 /**
  * Mark this entry cancelled, and test that mark.
  *
- * Set by exactly one caller - the laser_release() that takes refs to zero,
- * immediately before teardown. There is no public laser_cancel() any more:
- * cancelling was always the last consumer saying "I am done with this
- * device", which is what dropping the last claim already says.
- *
- * The test is deliberately lock-free and is called from the retry loop and
- * the chunk loops - see laser_entry_t::cancelled. It is NOT called from the
- * spin-up wait: that runs inside laser_acquire(), under g_registry_lock, on
- * an entry not yet published, so nothing can cancel it and the check there
- * was unreachable by construction.
+ * Set only by the laser_release() that drops the last claim, just before
+ * teardown. Tested without a lock, by the retry loop and the chunk loops
+ * (see laser_entry_t::cancelled) - not by the spin-up wait, which runs on an
+ * entry not yet published, that nothing can cancel.
  */
 void laser_set_cancelled(laser_entry_t *entry);
 int  laser_is_cancelled(const laser_entry_t *entry);
 
 /**
- * Is a CSS session currently open on this entry, by any consumer?
+ * Is a CSS session open on this entry, by any consumer?
  *
- * Deliberately NOT "is it mine": the enforcement this answers is "no key
- * command may touch authentication state unless SOMEBODY declared a session",
- * which is what stops an undeclared consumer stealing an AGID. Which consumer
- * it is is checked only at end(), by cookie.
+ * Deliberately not "is it mine": the rule enforced is that no key command
+ * touches authentication state without SOME declared session. Ownership is
+ * checked by cookie at end().
  */
 int laser_css_session_is_open(laser_entry_t *entry);
 
 /**
  * Does this CDB change the drive's CSS authentication state?
  *
- * Keyed on the KEY FORMAT, not the opcode: REPORT KEY and READ DVD STRUCTURE
- * each carry both state-changing steps and harmless read-only queries, and
- * conflating them refuses queries that libdvdcss legitimately issues outside
- * any session (dvdcss_test() reads copyright and RPC state before there is an
- * AGID to speak of). Used for two things that need exactly the same answer:
- * whether a session is required, and whether a retry is safe.
- *
- * The two opcodes are keyed in OPPOSITE DIRECTIONS, which is deliberate and
- * documented at the switch: REPORT KEY and SEND KEY name the formats that do
- * change state, READ DVD STRUCTURE names the two that do not. See the
- * implementation for why the open-ended one is the one that gets the
- * whitelist.
+ * Keyed on the key FORMAT, not the opcode: REPORT KEY and READ DVD STRUCTURE
+ * each carry both state-changing steps and read-only queries that libdvdcss
+ * issues outside any session. The answer decides two things: whether a
+ * session is required, and whether a retry is safe.
  */
 int laser_cdb_changes_css_state(const uint8_t *cdb, int cdb_len);
 
 /**
- * Select this device's Bulk-Only mass storage interface and its bulk
- * IN/OUT endpoint pair, filling entry->iface_num and entry->ep_in/ep_out.
+ * Select this device's Bulk-Only mass storage interface (class 0x08,
+ * protocol 0x50) and its bulk IN/OUT pair, filling entry->iface_num,
+ * entry->ep_in, entry->ep_out and entry->ep_max_packet.
  *
- * The interface is chosen on the evidence of the configuration
- * descriptor (class 0x08, protocol 0x50, with a usable bulk pair of its
- * own), not by index - see the implementation for why assuming interface
- * 0 is wrong on some enclosures.
- *
- * Must run BEFORE the interface is claimed, since its result is what
- * says which interface to claim. Reading the configuration descriptor
- * needs no claim.
+ * Runs before the interface is claimed, since it says which one to claim;
+ * reading the configuration descriptor needs no claim.
  *
  * @return 0 on success, -1 if the device exposes no such interface.
  */
 int laser_find_bulk_endpoints(laser_entry_t *entry);
 
 /**
- * USB Mass Storage Reset (class request, addressed to entry->iface_num)
- * + clear_halt on both endpoints,
- * to normalize the device's BOT state machine before the first SCSI
- * command is ever sent to it. Best-effort: failure to perform the reset
- * itself is logged but not fatal (some non-compliant drives don't
- * implement the request; the clear_halt calls are independently useful
- * regardless, and the first real SCSI command will reveal if the device
- * turns out to be unusable).
+ * Bulk-Only Mass Storage Reset (class request to entry->iface_num), then
+ * clear_halt on both endpoints, putting the device's BOT state machine in a
+ * known state. Best-effort: some drives do not implement the reset, and the
+ * clear_halt calls help regardless.
  */
 void laser_mass_storage_reset(laser_entry_t *entry);
 
 /**
- * Wake the drive and wait for its medium to become ready (TEST UNIT READY
- * in a loop), before any read is attempted on it. Called once at
- * registration, AFTER laser_probe_lun() and only when that probe got an
- * answer - see its doc below for why the order is that way round, and
- * registry.c for why silence is a reason to skip the wait rather than to
- * spend it. Best-effort otherwise: a drive that never reports ready still
- * falls through, and is still registered.
+ * Wake the drive and wait for its medium to become ready, before any read.
+ * Called once at registration, after laser_probe_lun() has found a unit that
+ * answers. Best-effort: a drive that never reports ready is still registered,
+ * with laser_entry_t::not_ready left set.
  *
- * BOUNDED IN REAL TIME, which matters to the caller: this is the slowest
- * step of registration, it runs with the registry lock held, and it is not
- * cancellable from outside. Its ceiling is LASER_SPINUP_MAX_WALL_MS (15s),
- * reached only by a drive that has stopped answering; a working drive,
- * present or empty, returns in well under a second. See the implementation
- * in scsi.c for the full rationale and both budgets.
+ * Bounded in real time by LASER_SPINUP_MAX_WALL_MS (15 s), reached only by a
+ * drive that has stopped answering; it runs under the registry lock and
+ * cannot be cancelled. A working drive, loaded or empty, returns within a few
+ * seconds. See scsi.c.
  */
 void laser_wait_until_ready(laser_entry_t *entry);
 
@@ -488,76 +302,36 @@ void laser_wait_until_ready(laser_entry_t *entry);
 enum {
     /** INQUIRY says direct-access block device. Not an optical drive. */
     LASER_OPTICAL_NO = 0,
-    /** INQUIRY answered, and not with a type that rules an optical drive out. */
+    /** INQUIRY answered, with a type that does not rule an optical drive
+     * out. */
     LASER_OPTICAL_YES = 1,
-    /** INQUIRY went unanswered. Neither a yes nor a no - see below. */
+    /** INQUIRY went unanswered on every unit. */
     LASER_OPTICAL_NO_ANSWER = -1,
-    /** The device left the bus during the probe. Not "would not answer" but
-     * "is not there": kept apart from LASER_OPTICAL_NO_ANSWER because the
-     * caller's response differs. Silence is a reason to register the device
-     * anyway and let a read fail quickly; absence is a reason not to register
-     * it at all, since every field the entry would carry describes a device
-     * that has gone. */
+    /** The device left the bus during the probe. */
     LASER_OPTICAL_GONE = -2,
 };
 
 /**
- * Work out which Logical Unit on this device is the optical drive, store it
- * in entry->lun, and say whether it is one.
+ * Work out which Logical Unit is the optical drive, store it in entry->lun,
+ * and say whether there is one.
  *
- * ONE FUNCTION, because selecting a unit and classifying it are one question
- * asked once. Split in two, the second half would re-issue the very INQUIRY
- * the choice had just been made on, and the two halves could disagree about
- * what "optical" means since each would classify the peripheral device type
- * itself.
+ * Issues GET MAX LUN, then an INQUIRY per unit, under the short probe
+ * timeouts, keeping the first unit whose peripheral device type is CD/DVD.
+ * Falls back to LUN 0 whenever anything is unsupported or inconclusive - as
+ * the class specification prescribes for a device that stalls GET MAX LUN,
+ * and as is right for the many drives with a single unit.
  *
- * Issues GET MAX LUN (the Bulk-Only class request) and an INQUIRY per unit,
- * keeping the first whose peripheral device type says CD/DVD. Falls back to
- * LUN 0 whenever anything is unsupported, fails, or comes back inconclusive
- * - which is both what the class specification prescribes for a device that
- * stalls GET MAX LUN, and the right answer for the overwhelming majority of
- * drives, which have exactly one unit.
+ * Only a direct-access block device is rejected: a card reader, identical to
+ * a drive in its USB descriptors, answers that, as does a USB key. Any other
+ * type is accepted, INQUIRY data not always being truthful.
  *
- * The classification is deliberately asymmetric: only a direct-access block
- * device is rejected. An optical drive and a card reader are identical at the
- * USB descriptor level (Mass Storage / Bulk-Only / SCSI all three), so
- * without this the only way to tell them apart is to wait out a spin-up on a
- * device that has no mechanism to spin, then read no filesystem from it -
- * several seconds, on every browse, for a foregone conclusion. Combo
- * enclosures pair the two, so this is not a corner case. Silence is not a
- * no, so it gets its own answer rather than being folded into either.
+ * INQUIRY needs no medium, so this runs before laser_wait_until_ready(), and
+ * a device that answers it on no unit is not warming up but not talking at
+ * all. The caller declines both that and LASER_OPTICAL_GONE, handing the
+ * device back to the kernel - the only agent able to reset it.
  *
- * LASER_OPTICAL_GONE IS NOT LASER_OPTICAL_NO_ANSWER. A device that has left
- * the bus fails every command instantly rather than timing out, and nothing
- * about it will change: the same drive plugged back in arrives as a new
- * descriptor and a new token.
- *
- * LASER_OPTICAL_NO_ANSWER MATTERS BEYOND "we could not tell". INQUIRY is
- * mandatory and needs no medium, so a device that will not serve it - after
- * this call has already spent its attempts and its settling delays on it - is
- * not a device that is still warming up: it is one that is not answering at
- * all. Waiting for such a device to become ready can only spend the whole
- * spin-up budget - seventeen seconds, measured on a card reader whose INQUIRY
- * times out - to conclude what this call already established.
- *
- * THE CALLER DECLINES ON THIS ANSWER. It used to register the device and
- * merely skip the wait, on the grounds that silence is not proof of the wrong
- * kind of device. That changed when the kernel driver stopped being handed
- * back on release: registering now means holding the interface for as long as
- * the device stays plugged in, and the kernel - the only agent that can
- * properly reset a device wedged mid-transfer - never gets it back. Declining
- * gives it back, which is the one thing that helps.
- *
- * Called once at registration, after the endpoints are known and the device
- * has been reset, since it needs to send real SCSI commands. Does NOT need
- * the medium: INQUIRY and GET MAX LUN are answered by a drive whose tray is
- * empty or still spinning up, which is why this runs BEFORE
- * laser_wait_until_ready() rather than after it. entry->lun is 0 (from the
- * caller's memset) until this runs, so a failure to call it at all degrades
- * to the previous behaviour rather than to something undefined.
- *
- * @return one of LASER_OPTICAL_YES, LASER_OPTICAL_NO, LASER_OPTICAL_NO_ANSWER
- *         or LASER_OPTICAL_GONE.
+ * @return LASER_OPTICAL_YES, LASER_OPTICAL_NO, LASER_OPTICAL_NO_ANSWER or
+ *         LASER_OPTICAL_GONE.
  */
 int laser_probe_lun(laser_entry_t *entry);
 
@@ -565,37 +339,26 @@ int laser_probe_lun(laser_entry_t *entry);
  * One Bulk-Only transaction (bot.c)
  * ========================================================================= */
 
-/** Raw bCSWStatus values, which laser_bot_send_locked() reports through its
- * csw_status out-parameter. Here rather than in bot.c because they are that
- * parameter's value space, and scsi.c is what reads it. */
+/** Raw bCSWStatus values, as reported through laser_bot_send_locked()'s
+ * csw_status out-parameter. */
 #define USB_BOT_STATUS_PASS        0x00
 #define USB_BOT_STATUS_FAIL        0x01
-/* Phase Error: the device and host disagree about the transfer that just
- * happened badly enough that the device's state machine is out of sync.
- * BBB 6.6.3 is explicit that this is the status a device returns when it
- * "may require a reset to recover", and 6.7 requires the host to perform a
- * Reset Recovery in response - clearing a stalled endpoint is NOT
- * sufficient, and issuing further commands before the reset is not
- * meaningful. */
+/* Host and device disagree about the transfer badly enough that the device's
+ * state machine is out of sync. BBB 6.7 requires a Reset Recovery before any
+ * further command; clearing a stalled endpoint is not enough. */
 #define USB_BOT_STATUS_PHASE_ERROR 0x02
 
-/** The CBW itself could not be handed over, so the drive never saw the
- * command at all and its state is provably unchanged - always safe to
- * replay. */
+/** The CBW could not be handed over: the drive never saw the command, and
+ * replaying it is always safe. */
 #define BOT_FAIL_NOT_SENT    (-2)
 
-/** The transaction ended in a state BBB requires a Reset Recovery for, and
- * laser_bot_send_locked() has already performed it. Retrying afterwards is
- * allowed but must be counted, since a device that lands here repeatedly is
- * broken rather than busy. */
+/** The transaction ended in a state requiring a Reset Recovery, which
+ * laser_bot_send_locked() has already performed. A retry is allowed but
+ * counted: a device landing here repeatedly is broken, not busy. */
 #define BOT_FAIL_PHASE_ERROR (-3)
 
-/** The device is no longer on the bus - unplugged, or its connection torn
- * down under us. Distinguished from an ordinary I/O failure because the
- * correct response is categorically different: nothing that waits or retries
- * can help, and every subsequent command will cost a full set of USB
- * timeouts to reach the same conclusion. A budget expressed in attempts
- * turns that into minutes of blocking. */
+/** The device is no longer on the bus. No wait or retry can help, and every
+ * further command would cost a full set of USB timeouts. */
 #define BOT_FAIL_NO_DEVICE   (-4)
 
 /**
@@ -603,10 +366,8 @@ int laser_probe_lun(laser_entry_t *entry);
  * direction, CSW - and, where BBB requires it, the Reset Recovery that must
  * follow before any other command is sent.
  *
- * Knows nothing about what the CDB means. Every decision that needs to -
- * whether to retry, what the sense data implies, whether the command was
- * idempotent - belongs to scsi.c, and this return value is what it decides
- * on:
+ * Knows nothing about what the CDB means; retries, sense data and
+ * idempotency are scsi.c's, decided on this return value:
  *
  *   0                     the command completed and the CSW says PASS
  *   BOT_FAIL_NOT_SENT     the drive never received it; replay is free
@@ -619,17 +380,10 @@ int laser_probe_lun(laser_entry_t *entry);
  *                         commands that are idempotent.
  *
  * @param csw_status optional, may be NULL. Receives the raw bCSWStatus of
- *        THIS call, or -1 when the attempt failed below the level of "a valid
- *        CSW was received at all" (transport error, stall, CBW never sent),
- *        in which case REQUEST SENSE is not meaningful because there is no
- *        completed command for the drive to explain.
- *
- *        An out-parameter rather than a field on `entry` on purpose: the
- *        value only means anything in the window between issuing a command
- *        and inspecting its outcome, and it is trivially clobbered - the
- *        caller's natural reaction to a FAIL is to send REQUEST SENSE, which
- *        comes right back through this same function and would overwrite any
- *        shared copy before the caller was done with it.
+ *        THIS call, or -1 when no valid CSW was received, in which case
+ *        REQUEST SENSE has no completed command to explain. An out-parameter
+ *        rather than a field on `entry`, since the REQUEST SENSE following a
+ *        FAIL goes through this same function.
  *
  * Caller MUST already hold entry->io_lock.
  */
