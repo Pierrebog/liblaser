@@ -796,7 +796,7 @@ laser_status_t laser_scsi_cdb(int token,
              "session open - refused. Call laser_css_session_begin() "
              "first; see the session contract in laser.h",
              token, entry->vid, entry->pid, cdb[0]);
-        return LASER_ERR_IO;
+        return LASER_ERR_INVALID;
     }
 
     /* Before queueing on io_lock, so that a command arriving during teardown

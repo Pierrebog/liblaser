@@ -562,7 +562,7 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
 {
     if (owner == NULL) {
         LOGE("css_session_begin(token=%d): NULL owner cookie", token);
-        return LASER_ERR_IO;
+        return LASER_ERR_INVALID;
     }
 
     /* A session needs a claim; begin() registers nothing. */
@@ -584,7 +584,7 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
             pthread_mutex_unlock(&entry->css_mtx);
             LOGE("css_session_begin(token=%d, usb %04x:%04x): this owner "
                  "already holds the session", token, entry->vid, entry->pid);
-            return LASER_ERR_IO;
+            return LASER_ERR_INVALID;
         }
         if (pthread_cond_timedwait(&entry->css_cv, &entry->css_mtx,
                                    &deadline) == ETIMEDOUT) {

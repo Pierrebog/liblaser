@@ -143,13 +143,11 @@ typedef enum {
 
     /** A caller violated this header's contract: a NULL or oversized CDB, a
      * negative data length, a data phase announced with no buffer, a sector
-     * type outside laser_cd_sector_t. Nothing about the device is touched.
+     * type outside laser_cd_sector_t, a CSS command with no session open, a
+     * NULL or re-entrant session cookie. Nothing about the device is touched.
      *
      * Kept apart from LASER_ERR_IO, so that a bug in the caller is not taken
-     * for a hardware failure and answered with retries.
-     *
-     * NOT used by laser_css_session_begin(), which returns LASER_ERR_IO for a
-     * NULL cookie: it predates this value, and libdvdcss expects that. */
+     * for a hardware failure and answered with retries. */
     LASER_ERR_INVALID = -8,
 
     /** The last claim on this token was dropped while the operation was
@@ -298,7 +296,7 @@ int laser_token_not_ready(int token);
  *   - serialization with every other command on the same token.
  *
  * A command that changes CSS authentication state is refused with
- * LASER_ERR_IO unless a CSS session is open on the token (see below).
+ * LASER_ERR_INVALID unless a CSS session is open on the token (see below).
  *
  * ARGUMENT VALIDATION: a NULL or out-of-range cdb (cdb_len must be 1..16,
  * the CBW's command field being 16 bytes), a negative data_len, or a NULL
@@ -351,7 +349,8 @@ laser_status_t laser_scsi_cdb(int token,
  * CONTRACT
  *   - Commands that change authentication state (an AGID request, the
  *     handshake steps, a title/disc key read, an AGID invalidation) are
- *     refused with LASER_ERR_IO unless SOME session is open on the token.
+ *     refused with LASER_ERR_INVALID unless SOME session is open on the
+ *     token.
  *     Read-only queries - copyright, RPC state, ASF - never need one.
  *   - end() must be called with the same cookie, on every path out. A leaked
  *     session blocks the next consumer for LASER_CSS_SESSION_MAX_WAIT_MS and
@@ -382,9 +381,9 @@ laser_status_t laser_scsi_cdb(int token,
  * @param owner stable, non-NULL pointer identifying the consumer.
  * @return LASER_OK - and only then must laser_css_session_end() be
  *         called - LASER_ERR_NO_SUCH_TOKEN if no claim is held on the token,
- *         or LASER_ERR_IO on timeout, on a re-entrant begin() by the same
- *         owner, or on a NULL @p owner (see LASER_ERR_INVALID's note: this
- *         one predates that value and keeps LASER_ERR_IO).
+ *         LASER_ERR_INVALID on a NULL @p owner or on a re-entrant begin() by
+ *         the same owner, or LASER_ERR_IO if another consumer's session is
+ *         still open after LASER_CSS_SESSION_MAX_WAIT_MS.
  */
 laser_status_t laser_css_session_begin(int token, const void *owner);
 
