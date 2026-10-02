@@ -4,7 +4,7 @@
  * Copyright (C) 2026 Authors
  *
  * Authors: Pierre Bogdanovscky
- * Co-authored-by: claude-code:claude-opus-5-0
+ * Co-authored-by: claude-code:claude-opus-5-5
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -20,13 +20,12 @@
  * along with this library; if not, write to the Free Software Foundation,
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************
- * The one-time USB-level setup of a device, called from laser_register() in
- * registry.c before any SCSI command is issued: which interface carries the
- * Bulk-Only function, where its bulk endpoint pair is, and putting the
- * device's BOT state machine into a known state.
+ * USB-level work below the SCSI layer: finding the interface that carries
+ * the Bulk-Only function and its bulk endpoint pair, once at registration,
+ * and the Mass Storage Reset that puts the device's BOT state machine in a
+ * known state - at registration, in Reset Recovery and at teardown.
  *
- * Nothing here speaks SCSI or builds a CBW - that is bot.c - and nothing
- * here knows about retries or sense codes, which is scsi.c.
+ * No CBW here (bot.c), no retries or sense codes (scsi.c).
  *****************************************************************************/
 
 #include <unistd.h>
@@ -35,27 +34,23 @@
 #include "laser_internal.h"
 
 /* Bulk-Only Mass Storage Reset (USB Mass Storage Class Bulk-Only Transport,
- * rev 1.0, section 3.1) - a class request on the interface, not a command on
- * the bulk pipes, which is why it is here rather than in bot.c: nothing about
- * it goes through a CBW. */
+ * rev 1.0, section 3.1): a class request on the interface, not a command on
+ * the bulk pipes - hence here rather than in bot.c. */
 #define USB_BOT_RESET_bREQUEST        0xFF
 #define USB_BOT_RESET_bmREQUESTTYPE   0x21  /* Class | Interface | Host-to-Device */
 
 /* ============================================================================
- * Endpoint discovery / Mass Storage Reset - called once, from
- * laser_register() in registry.c, before any SCSI command is issued.
+ * Endpoint discovery, called once from laser_register() in registry.c,
+ * before the interface is claimed.
  * ============================================================================ */
 
 /* USB Mass Storage class codes.
  *
- * The interface is identified by its class and its PROTOCOL, not by its
- * subclass: the protocol byte is what says "this interface speaks
- * Bulk-Only Transport", which is the only thing this file implements.
- * The subclass merely names which command set rides on top (0x06 =
- * SCSI transparent, 0x02 = ATAPI/MMC, and a few historical others), and
- * every one of them is SCSI-MMC as far as an optical drive is
- * concerned. Matching on the subclass as well would reject a conformant
- * drive that declares one of the older values for no gain. */
+ * The interface is matched on class and PROTOCOL: the protocol says "Bulk-Only
+ * Transport", the only thing implemented here. The subclass only names the
+ * command set on top (0x06 SCSI transparent, 0x02 ATAPI/MMC, a few historical
+ * others), all of which are SCSI-MMC to an optical drive; matching on it would
+ * reject conformant drives for no gain. */
 #define USB_CLASS_MASS_STORAGE      0x08
 #define USB_MS_PROTOCOL_BULK_ONLY   0x50
 #define USB_MS_SUBCLASS_MMC         0x02
@@ -72,29 +67,16 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
         return -1;
     }
 
-    /* Find the Bulk-Only mass storage interface and take its endpoint
-     * pair - both, from the SAME interface, or neither.
-     *
-     * The previous version scanned every interface and kept the first
-     * bulk IN and the first bulk OUT it saw anywhere, while registry.c
-     * claimed interface 0 unconditionally. On the single-interface
-     * drives this was developed against those are the same thing. On a
-     * device whose interface 0 is something else - a front-panel HID, a
-     * vendor-specific function, a second mass-storage function ordered
-     * first - they are not: every transfer then goes to endpoints
-     * belonging to an interface nobody claimed. A caller's own candidate
-     * filter may well accept such a device - VLC's does, testing the
-     * interface list rather than requiring index 0 - so
-     * nothing upstream rules the case out either.
-     *
-     * Hence: the interface is chosen HERE, on evidence, and its number
-     * is recorded on the entry. Everything that needs an interface
-     * number afterwards - claim, release, Mass Storage Reset, GET MAX
-     * LUN - reads entry->iface_num rather than assuming a value. */
+    /* The first Bulk-Only mass storage interface, and its endpoint pair -
+     * both from that SAME interface, or neither. Interface 0 is not assumed:
+     * a front-panel HID, a vendor function or a second mass-storage function
+     * may come first, and endpoints taken from one interface while another
+     * is claimed go to an interface nobody owns. Everything that needs an
+     * interface number later - claim, release, Mass Storage Reset, GET MAX
+     * LUN - reads entry->iface_num. */
     for (int i = 0; i < cfg->bNumInterfaces; i++) {
-        /* An interface with no alternate setting at all has no
-         * descriptor to inspect. Vanishingly rare, but altsetting[0]
-         * would be a read out of bounds. */
+        /* No alternate setting means no descriptor to inspect, and
+         * altsetting[0] would be out of bounds. */
         if (cfg->interface[i].num_altsetting < 1) {
             continue;
         }
@@ -119,10 +101,8 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
 
             if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) && !ep_in) {
                 ep_in = ep->bEndpointAddress;
-                /* Bits 10:0 only - bits 12:11 are the additional-transactions
-                 * field on high-speed periodic endpoints, and although they
-                 * are reserved-zero for bulk, masking costs nothing and keeps
-                 * the comparison below honest. */
+                /* Bits 10:0: bits 12:11 are the additional-transactions field
+                 * of high-speed periodic endpoints, reserved-zero for bulk. */
                 ep_in_mps = ep->wMaxPacketSize & 0x07ff;
             } else if (!(ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) && !ep_out) {
                 ep_out = ep->bEndpointAddress;
@@ -144,30 +124,19 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
         entry->ep_out = ep_out;
         entry->ep_max_packet = ep_in_mps < ep_out_mps ? ep_in_mps : ep_out_mps;
 
-        /* THE ENUMERATED LINK SPEED, read off the endpoint rather than asked
-         * for - because libusb_get_device_speed() answers from sysfs and an
-         * older kernel simply does not fill it in, reporting
-         * LIBUSB_SPEED_UNKNOWN for a link that is working perfectly well.
-         * wMaxPacketSize on a bulk endpoint has no such gap: the value is
-         * fixed by the speed the device enumerated at, so it says what
-         * actually happened.
+        /* The link speed the device enumerated at, read off the endpoint:
+         * libusb_get_device_speed() answers from sysfs, which some kernels do
+         * not fill in.
          *
-         *    64 -> full speed. USB 1.1 signalling, 12Mbit/s raw, roughly
-         *          1MB/s of usable bulk throughput once protocol overhead is
-         *          paid. A DVD-Video peaks at about 1.26MB/s and a Blu-ray
-         *          feature runs 3-5MB/s, so this is a link on which DVD is
-         *          marginal and Blu-ray is arithmetically impossible.
-         *   512 -> high speed, USB 2.0. Ample for either.
+         *    64 -> full speed, USB 1.1: about 1 MB/s of usable bulk
+         *          throughput. A DVD-Video peaks near 1.26 MB/s and a Blu-ray
+         *          runs 3-5 MB/s: marginal for one, impossible for the other.
+         *   512 -> high speed, USB 2.0: ample for either.
          *  1024 -> SuperSpeed.
          *
-         * WORTH COMPARING ACROSS REGISTRATIONS, not just reading once. A
-         * USB 3 bridge on a USB 2.0 port normally trains down to high speed;
-         * marginal cabling or a sagging supply can drop it further, to full
-         * speed, and that fallback is negotiated per enumeration rather than
-         * fixed by the hardware. A number that changes between plug-ins - or
-         * between a run that played smoothly and one that did not - is a
-         * link problem and not a transport one, and nothing in this library
-         * can raise the ceiling it sets. */
+         * Worth comparing across plug-ins: marginal cabling or a sagging
+         * supply can make a drive enumerate at full speed one time and high
+         * speed the next, a link problem nothing here can fix. */
         const uint16_t mps = entry->ep_max_packet;
         LOGI("usb %04x:%04x: interface %u bulk endpoints, wMaxPacketSize "
              "in=%u out=%u -> %s",
@@ -180,10 +149,8 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
 
         if (iface->bInterfaceSubClass != USB_MS_SUBCLASS_SCSI &&
             iface->bInterfaceSubClass != USB_MS_SUBCLASS_MMC) {
-            /* Accepted - the protocol byte is what matters - but worth
-             * naming in the log, since an unusual command-set subclass
-             * is the sort of thing a later per-device workaround would
-             * want to correlate against. */
+            /* Accepted, but logged: a per-device workaround may one day want
+             * to correlate against an unusual subclass. */
             LOGI("usb %04x:%04x: interface %u has unusual mass-storage "
                  "subclass 0x%02x, using it anyway",
                  entry->vid, entry->pid, iface->bInterfaceNumber,
@@ -203,6 +170,10 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
     return -1;
 }
 
+/* ============================================================================
+ * Mass Storage Reset - see laser_internal.h.
+ * ============================================================================ */
+
 void laser_mass_storage_reset(laser_entry_t *entry)
 {
     int ret = libusb_control_transfer(entry->handle,
@@ -218,7 +189,7 @@ void laser_mass_storage_reset(laser_entry_t *entry)
     libusb_clear_halt(entry->handle, entry->ep_in);
     libusb_clear_halt(entry->handle, entry->ep_out);
 
-    /* Some drives need a brief moment after a reset before they process
-     * the very next command reliably. */
+    /* Some drives need a moment after a reset before they process the next
+     * command reliably. */
     usleep(100 * 1000);
 }
