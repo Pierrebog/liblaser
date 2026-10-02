@@ -889,21 +889,12 @@ laser_status_t laser_scsi_cdb(int token,
             break;
         }
 
-        /* A non-idempotent command the drive may have acted on: stop. Unless
-         * the CBW never left, in which case the drive's state is untouched. */
-        if (!idempotent && rc != BOT_FAIL_NOT_SENT) {
-            LOGW("token=%d: DATA-OUT command failed after the CBW was sent, "
-                 "not retrying (drive state may have advanced)", token);
-            result = LASER_ERR_IO;
-            break;
-        }
-
         uint8_t sense_key = 0xff, asc = 0, ascq = 0;
         if (rc == BOT_FAIL_PHASE_ERROR) {
             /* The device was just reset: there is no completed command left
              * for REQUEST SENSE to explain. The attempt still counts. */
-            LOGW("token=%d: retrying after Reset Recovery (attempt %d/%d)",
-                 token, attempt, LASER_MAX_RETRIES);
+            LOGW("token=%d: cdb 0x%02x ended in a Reset Recovery (attempt "
+                 "%d/%d)", token, cdb[0], attempt, LASER_MAX_RETRIES);
         } else if (csw_status == USB_BOT_STATUS_FAIL) {
             request_sense_locked(entry, &sense_key, &asc, &ascq);
             last_sense_key = sense_key;
@@ -928,15 +919,6 @@ laser_status_t laser_scsi_cdb(int token,
             result = LASER_ERR_MEDIA_GONE;
             break;
         }
-        if (asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
-            ascq == SCSI_ASCQ_FORMAT_LAYER_CHANGED) {
-            /* A dual-layer DVD crossing layers, around the middle of a film:
-             * the read that follows normally succeeds, so the ordinary
-             * delayed retry below applies. */
-            LOGW("token=%d: format layer changed (dual-layer boundary), "
-                 "retrying", token);
-        }
-
         /* Copy-protection refusals, told apart before the generic refusal
          * below swallows them. None is retried, but they mean different
          * things to the caller, who cannot recover the qualifier once this
@@ -990,6 +972,29 @@ laser_status_t laser_scsi_cdb(int token,
             reason_logged = 1;
             result = LASER_ERR_REFUSED;
             break;
+        }
+
+        /* A non-idempotent command the drive may have acted on: stop here,
+         * unless its CBW never went out. Only here, after the sense has been
+         * read and classified above: REQUEST SENSE replays nothing, and
+         * without it a refused key command - a region mismatch during the
+         * handshake, a disc gone - reached libdvdcss as a bare I/O error. */
+        if (!idempotent && rc != BOT_FAIL_NOT_SENT) {
+            LOGW("token=%d: key command 0x%02x failed after its CBW was sent "
+                 "(sense %02x/%02x/%02x), not retrying - the drive's state may "
+                 "have advanced", token, cdb[0], sense_key, asc, ascq);
+            reason_logged = 1;
+            result = LASER_ERR_IO;
+            break;
+        }
+
+        if (asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
+            ascq == SCSI_ASCQ_FORMAT_LAYER_CHANGED) {
+            /* A dual-layer DVD crossing layers, around the middle of a film:
+             * the read that follows normally succeeds, so the ordinary
+             * delayed retry below applies. */
+            LOGW("token=%d: format layer changed (dual-layer boundary), "
+                 "retrying", token);
         }
 
         /* UNIT ATTENTION clears itself by being reported: retry at once.
