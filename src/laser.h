@@ -45,6 +45,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* LASER_VERSION_MAJOR, _MINOR, _MICRO, _STRING, LASER_VERSION and
+ * LASER_VERSION_CODE(), generated from the build's version. */
+#include "laser_version.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

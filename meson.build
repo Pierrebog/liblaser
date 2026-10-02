@@ -1,7 +1,8 @@
 # liblaser - Library for Accessing SCSI External Readers.
 #
 # Builds liblaser.a, a static archive with a single member exporting exactly
-# the public API, and installs it with laser.h, laser_disc.h and liblaser.pc.
+# the public API, and installs it with laser.h, laser_disc.h, laser_version.h
+# and liblaser.pc.
 #
 # Layout:
 #   src/                - registry.c / usb.c / bot.c / scsi.c / disc.c and headers
@@ -18,10 +19,29 @@
 project('liblaser', 'c',
     version: '0.2.1',
     license: 'LGPL-2.1-or-later',
-    meson_version: '>= 0.60.0')
+    meson_version: '>= 0.60.0',
+    # GNU C11: _Static_assert in bot.c, and ##__VA_ARGS__ in LOG_QUIRK().
+    default_options: ['c_std=gnu11'])
 
 cc = meson.get_compiler('c')
 threads_dep = dependency('threads')
+
+# laser_version.h, from the project version above - the one place it is set.
+laser_version = meson.project_version().split('.')
+laser_version_conf = configuration_data()
+laser_version_conf.set('LASER_VERSION_MAJOR', laser_version[0])
+laser_version_conf.set('LASER_VERSION_MINOR', laser_version[1])
+laser_version_conf.set('LASER_VERSION_MICRO', laser_version[2])
+
+configure_file(
+    input: 'src/laser_version.h.in',
+    output: 'laser_version.h',
+    configuration: laser_version_conf,
+    install: true,
+    install_dir: get_option('includedir'))
+
+# The build directory, where laser_version.h is generated, and src/.
+laser_inc = include_directories('.', 'src')
 
 # Everything this library promises, and nothing else: the union of laser.h and
 # laser_disc.h. A function added to either and forgotten here does not fail to
@@ -32,6 +52,7 @@ laser_public_symbols = [
     'laser_parse_token',
     'laser_acquire',
     'laser_release',
+    'laser_token_not_ready',
     'laser_scsi_cdb',
     'laser_css_session_begin',
     'laser_css_session_end',
@@ -102,7 +123,7 @@ laser_internal = static_library('laser-own',
         'src/scsi.c',
         'src/disc.c',
     ),
-    include_directories: [libusb_inc, libudfread_inc],
+    include_directories: [laser_inc, libusb_inc, libudfread_inc],
     c_args: laser_warning_args,
     dependencies: threads_dep,
     override_options: ['warning_level=2'],
@@ -148,4 +169,4 @@ pkg.generate(
 # For use as a meson subproject.
 liblaser_dep = declare_dependency(
     link_with: liblaser,
-    include_directories: include_directories('src'))
+    include_directories: laser_inc)
