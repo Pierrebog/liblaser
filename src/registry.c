@@ -4,7 +4,7 @@
  * Copyright (C) 2026 Authors
  *
  * Authors: Pierre Bogdanovscky
- * Co-authored-by: claude-code:claude-opus-5-0
+ * Co-authored-by: claude-code:claude-opus-5-5
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License as published by
@@ -20,29 +20,15 @@
  * along with this library; if not, write to the Free Software Foundation,
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************
+ * Maps a token - an already-open USB device fd, on Android the one obtained
+ * through UsbManager - to a device wrapped in a dedicated libusb context,
+ * ready for SCSI-MMC transactions through bot.c and scsi.c. See laser.h for
+ * the contract.
  *
- * See laser.h for the full contract. Summary of what happens
- * here: an unseen token, the first time laser_acquire() is called on it,
- * gets registered - treated as an already
- * permission-granted fd - on Android, the one obtained through UsbManager,
- * which is the only thing on that system allowed to open a raw device path
- * under /dev/bus/usb for an unprivileged app - and wrapped
- * with a dedicated libusb context, ready for SCSI-MMC transactions via bot.c
- * and scsi.c.
- *
- * REGISTRATION HANGS OFF THE CLAIM, and off nothing else. laser_register()
- * below is static and reachable only from laser_acquire(); every other entry
- * point of this library looks a token up and fails if it is not there. A
- * device registered without a claim would be one nothing could destroy, since
- * teardown only ever happens on the 1 -> 0 transition of the claim count: it
- * would hold a libusb handle and one of LASER_MAX_DEVICES slots for the life
- * of the process, and once its owner closed the descriptor underneath it and
- * the OS recycled that number, it could be handed out for a completely
- * different device.
- *
- * Every consumer in this project acquires before it does anything - the laser
- * access module in both its Open paths, cdrom.c in ioctl_Open(), libdvdcss in
- * dvdcss_open().
+ * A device is registered only by laser_acquire(), and torn down only when
+ * its last claim is released. A registration without a claim could never be
+ * torn down: it would hold a table slot for the life of the process and,
+ * once its fd number was recycled, answer for another device.
  *****************************************************************************/
 
 #include <errno.h>
@@ -61,30 +47,11 @@
 #include "laser.h"
 #include "laser_internal.h"
 
-/* Which clock the CSS condition variable runs on.
- *
- * CLOCK_MONOTONIC is what we want: laser_css_session_begin() waits against an
- * absolute deadline, and a wall-clock deadline is at the mercy of the wall
- * clock being stepped - which on Android is not exotic, NTP and the carrier's
- * time settling within seconds of a boot or a network change, exactly when a
- * browse is likely to be running.
- *
- * Asking for it needs pthread_condattr_setclock(), which bionic marks
- * __INTRODUCED_IN(21). Below that the declaration exists but the symbol does
- * not, so the call compiles and the LINK fails - which is how this was found,
- * on the 32-bit ABI, VLC-Android building armeabi-v7a against a lower API
- * level than the 64-bit ones:
- *
- *     undefined reference to 'pthread_condattr_setclock'
- *
- * So the clock is chosen at compile time and named ONCE. Both the condvar's
- * creation and css_deadline() read this macro, which is the whole point: the
- * two must agree, since pthread_cond_timedwait() interprets its timespec on
- * the condvar's own clock and would otherwise wait for the difference between
- * two epochs. On an API level without the call, the wait degrades to what it
- * was before the monotonic clock was requested at all - a backstop that a
- * clock step can stretch or shorten, which is survivable because the value is
- * a ceiling on a failure path and not a measurement. */
+/* Clock of the CSS condition variable. CLOCK_MONOTONIC, so that a clock step
+ * cannot stretch or shorten laser_css_session_begin()'s deadline - except
+ * below Android API 21, where pthread_condattr_setclock() does not exist and
+ * the default CLOCK_REALTIME has to do. The condvar's creation and
+ * css_deadline() must agree on the clock, hence one macro for both. */
 #if !defined(__ANDROID_API__) || __ANDROID_API__ >= 21
 # define LASER_CSS_CLOCK CLOCK_MONOTONIC
 #else
@@ -92,31 +59,19 @@
 #endif
 
 /* ---------------------------------------------------------------------------
- * Logging - the sink for the LOGI/LOGW/LOGE macros in laser_internal.h.
+ * Logging: the sink behind the LOGI/LOGW/LOGE macros of laser_internal.h.
  * ------------------------------------------------------------------------- */
 
 #define LOG_TAG "Laser"
 
-/* Bound on one formatted line. The longest this library produces is a
- * registration summary naming vid, pid, bcd, interface, both endpoints and
- * the LUN; 512 is several times that. Truncation would be silent, but the
- * alternative - allocating per line, on a path that runs inside the
- * transaction loop - trades a cosmetic failure for one that matters. */
+/* Longest formatted line; longer ones are truncated. */
 #define LOG_LINE_MAX 512
 
 static laser_log_cb_t g_log_cb;
 static void          *g_log_opaque;
 
-/* Where a line goes when no consumer has installed a sink of its own.
- *
- * PER PLATFORM, AND ONLY HERE. This is the one place in the library that
- * knows what operating system it is running on: everything above it deals in
- * libusb, SCSI and file descriptors, none of which need to know. A consumer
- * that wants its own sink calls laser_set_log_cb() and this is never reached.
- *
- * "%s" and not msg directly, in both branches: the message has already been
- * formatted, and anything in it that looks like a conversion is data by then
- * - a volume label, a device string. */
+/* Platform default, used until laser_set_log_cb() installs a sink: the system
+ * log on Android, stderr elsewhere. msg is already formatted, hence "%s". */
 static void default_log_cb(void *opaque, laser_log_level_t level,
                            const char *msg)
 {
@@ -127,6 +82,7 @@ static void default_log_cb(void *opaque, laser_log_level_t level,
     switch (level) {
     case LASER_LOG_ERROR: prio = ANDROID_LOG_ERROR; break;
     case LASER_LOG_WARN:  prio = ANDROID_LOG_WARN;  break;
+    case LASER_LOG_INFO:
     default:              prio = ANDROID_LOG_INFO;  break;
     }
 
@@ -136,12 +92,10 @@ static void default_log_cb(void *opaque, laser_log_level_t level,
     switch (level) {
     case LASER_LOG_ERROR: prio = "E"; break;
     case LASER_LOG_WARN:  prio = "W"; break;
+    case LASER_LOG_INFO:
     default:              prio = "I"; break;
     }
 
-    /* stderr rather than stdout: a library has no claim on a program's
-     * output, and a diagnostic that ends up piped into a consumer's data is
-     * worse than one nobody reads. */
     fprintf(stderr, "%s/%s: %s\n", prio, LOG_TAG, msg);
 #endif
 }
@@ -189,10 +143,8 @@ int laser_parse_token(const char *str, int *token)
 
 static laser_entry_t g_entries[LASER_MAX_DEVICES];
 
-/** Guards insertion/removal/lookup of entries in g_entries (i.e. the
- * "in_use"/"token" bookkeeping) - NOT the USB I/O itself, which is
- * guarded per-entry by entry->io_lock. Held only for the short,
- * non-blocking critical sections below. */
+/** Guards the bookkeeping of g_entries (in_use, token), not USB I/O, which
+ * entry->io_lock serializes. Held only briefly, never across I/O. */
 static pthread_mutex_t g_table_lock = PTHREAD_MUTEX_INITIALIZER;
 
 laser_entry_t *laser_lookup(int token)
@@ -201,10 +153,8 @@ laser_entry_t *laser_lookup(int token)
 
     pthread_mutex_lock(&g_table_lock);
     for (int i = 0; i < LASER_MAX_DEVICES; i++) {
-        /* `in_use` alone is enough: registration publishes it LAST, so a
-         * half-built entry - one whose ctx, handle and endpoints are not yet
-         * filled in, which lasts seconds - is not in the table to be found.
-         * See the field's doc comment in laser_internal.h. */
+        /* in_use is set last by laser_register(), so a half-built entry is
+         * never found. */
         if (g_entries[i].in_use && g_entries[i].token == token) {
             found = &g_entries[i];
             break;
@@ -221,16 +171,9 @@ int laser_token_not_ready(int token)
     return entry != NULL && entry->not_ready;
 }
 
-/** The cancellation flag's only two accessors, kept together so the asymmetry
- * between them is visible in one place: the write is serialized, the read is
- * not. See the field's comment in laser_internal.h for why that is sound -
- * and why the read must NOT take the table lock, being on the transaction
- * path.
- *
- * The write has exactly one caller, laser_release() at the 1 -> 0 transition.
- * The table lock here is not what makes the flag visible - the only
- * transition is 0 -> 1, and a reader that misses it sees it one attempt later
- * - it is what keeps the write from racing with release_slot()'s memset. */
+/** Accessors of laser_entry_t::cancelled. The write takes the table lock so
+ * that it cannot race with release_slot()'s memset. The read takes none: it
+ * is on the transaction path, and the flag only ever goes from 0 to 1. */
 void laser_set_cancelled(laser_entry_t *entry)
 {
     pthread_mutex_lock(&g_table_lock);
@@ -243,21 +186,9 @@ int laser_is_cancelled(const laser_entry_t *entry)
     return entry->cancelled;
 }
 
-/** Picks a free slot for `fd` (used directly as the token - see the file
- * header) and zeroes it, or returns NULL if the fd is already registered or
- * the table is full.
- *
- * DOES NOT PUBLISH IT. The slot is left with in_use == 0, which means
- * laser_lookup() cannot find it, which means nothing can reach a half-built
- * entry - laser_register() sets in_use at the very end, once ctx, handle and
- * endpoints are all in place. That is what let the separate `ready` flag go.
- *
- * The "already registered" scan is therefore looking at published entries
- * only, and cannot see one still under construction. It does not need to:
- * every caller of this function holds g_registry_lock, and laser_acquire()
- * has already looked the token up under that same lock, so there is never
- * more than one registration in flight and never one for a token that
- * already has an entry. The scan remains as a cheap assertion of that.
+/** Reserves and zeroes a free slot for @p fd, or returns NULL if the fd is
+ * already registered or the table is full. The slot stays unpublished
+ * (in_use == 0) until laser_register() has filled it in.
  *
  * Caller MUST hold g_registry_lock. */
 static laser_entry_t *reserve_slot(int fd)
@@ -286,17 +217,8 @@ static laser_entry_t *reserve_slot(int fd)
     return slot;
 }
 
-/** Undoes reserve_slot() on failure, so a failed registration doesn't leak
- * a permanently-reserved table entry.
- *
- * The memset is what frees the slot - in_use, token and every field behind
- * them go to zero together, which is also what reserve_slot() relies on when
- * it hands the slot back out. No explicit `slot->in_use = 0` follows: it
- * would restate one byte the memset has already written, and read as though
- * the memset were incomplete.
- *
- * Also used by teardown, which is why it is not named after the failure
- * path. */
+/** Frees a slot, after a failed registration or at teardown. The memset
+ * clears in_use along with everything else. */
 static void release_slot(laser_entry_t *slot)
 {
     pthread_mutex_lock(&g_table_lock);
@@ -304,15 +226,8 @@ static void release_slot(laser_entry_t *slot)
     pthread_mutex_unlock(&g_table_lock);
 }
 
-/* libusb's speed enum is NOT the USB generation number, and reading it as one
- * is off by a place at every value: LOW is 1, FULL 2, HIGH 3, SUPER 4. A drive
- * negotiating USB 2.0 high speed therefore reports 3, which is easy to misread
- * as SuperSpeed - and on a bus-powered optical drive the difference between
- * "negotiated USB 3" and "fell back to USB 2" is worth being able to read at a
- * glance. Hence a name rather than the number alone.
- *
- * The number is logged too, so a value this does not know about - a speed
- * added to a later libusb - still says something. */
+/* libusb's speed enum is not the USB generation: LOW is 1, FULL 2, HIGH 3,
+ * SUPER 4. A name keeps high speed from being misread as USB 3. */
 static const char *speed_name(int speed)
 {
     switch (speed) {
@@ -326,12 +241,8 @@ static const char *speed_name(int speed)
     }
 }
 
-/* Hand the interface's kernel driver back, if we were the ones who took it.
- *
- * Only meaningful on a path that is giving the device up: see the call site
- * in laser_register()'s unwind ladder for why a device we keep is never
- * re-attached. Best-effort - the device may already be gone, which is not an
- * error worth a warning of its own. */
+/* Give the interface's kernel driver back, if we detached it. Only on paths
+ * that give the device up - see the detach in laser_register(). */
 static void reattach_kernel_driver(laser_entry_t *entry)
 {
     if (!entry->kernel_driver_detached)
@@ -353,14 +264,9 @@ static void reattach_kernel_driver(laser_entry_t *entry)
     }
 }
 
-/** Does the actual one-time device setup: wraps fd with a dedicated
- * libusb context, works out WHICH interface carries the Bulk-Only
- * function and where its endpoints are (interface 0 is not assumed - see
- * laser_find_bulk_endpoints()), claims that interface, resets BOT
- * state, settles on the optical logical unit and waits for the drive to spin
- * up. Internal only, and reachable only from laser_acquire() - see the file
- * header. Token and fd are the same value throughout this project (see
- * laser.h), so this only takes one parameter.
+/** One-time device setup: dedicated libusb context, Bulk-Only interface and
+ * endpoints, claim, Mass Storage Reset, optical LUN, spin-up wait. Reachable
+ * only from laser_acquire().
  *
  * Caller MUST hold g_registry_lock. */
 static int laser_register(int fd)
@@ -372,8 +278,7 @@ static int laser_register(int fd)
     }
 
     /* Identity of the descriptor, for the recycling check in laser_acquire().
-     * A failure here is not fatal: zeroes never match a real fstat(), so the
-     * check degrades to "always suspect" rather than to "always trust". */
+     * Left at zero on failure, which fd_still_ours() reads as unknown. */
     struct stat st;
     if (fstat(fd, &st) == 0) {
         entry->reg_dev = st.st_dev;
@@ -382,30 +287,21 @@ static int laser_register(int fd)
         LOGW("register(fd=%d): fstat failed, identity check disabled", fd);
     }
 
-    /* Full size until something proves otherwise. The slot was memset by
-     * reserve_slot(), so this cannot be left to the zero: a cap of 0 would
-     * clamp every chunk to a single block. */
+    /* Full size until the device proves otherwise; the memset left 0. */
     entry->max_transfer_bytes = LASER_MAX_BYTES_PER_TRANSFER;
 
+    /* io_lock serializes transactions; css_mtx and css_cv guard the CSS
+     * session. */
     if (pthread_mutex_init(&entry->io_lock, NULL) != 0) {
         LOGE("register(fd=%d): pthread_mutex_init(io_lock) failed", fd);
         goto err_slot;
     }
-    /* The CSS session's lock and condvar are created together with io_lock so
-     * a reader sees at a glance that there are two levels of exclusion here
-     * and that neither is optional. */
     if (pthread_mutex_init(&entry->css_mtx, NULL) != 0) {
         LOGE("register(fd=%d): pthread_mutex_init(css_mtx) failed", fd);
         goto err_io_mutex;
     }
-    /* Created against LASER_CSS_CLOCK - see the macro above for why that is
-     * not simply CLOCK_MONOTONIC, and why css_deadline() has to read the same
-     * name.
-     *
-     * The attribute dance is skipped entirely when the clock is the default
-     * one, rather than asking for CLOCK_REALTIME explicitly: on the API levels
-     * this branch exists for, the function that would carry the request does
-     * not exist either. */
+    /* On LASER_CSS_CLOCK. Without pthread_condattr_setclock(), the default
+     * clock is already CLOCK_REALTIME. */
 #if LASER_CSS_CLOCK != CLOCK_REALTIME
     pthread_condattr_t css_cv_attr;
     if (pthread_condattr_init(&css_cv_attr) != 0) {
@@ -427,25 +323,10 @@ static int laser_register(int fd)
         goto err_css_mutex;
     }
 
-    /* Dedicated context - see laser_internal.h's doc comment on
-     * laser_entry_t::ctx for why this must not be the shared/NULL
-     * default context.
-     *
-     * NO_DEVICE_DISCOVERY, because this library never enumerates: it is
-     * given a descriptor and works from that. On a system where the caller
-     * cannot read /dev/bus/usb - Android, for an unprivileged app - libusb's
-     * normal enumeration at init has nothing it is allowed to look at, and
-     * depending on the version either fails outright or spends the attempt
-     * walking a directory it cannot open. The supported arrangement is
-     * exactly the one this file uses: no discovery, and a device obtained
-     * solely by wrapping a descriptor its owner already opened
-     * (libusb_wrap_sys_device below).
-     *
-     * Consequence worth stating: this context can never enumerate or
-     * hotplug-notify. Neither is wanted here - the caller owns device
-     * attach/detach through UsbManager and drives open/close explicitly -
-     * but it does mean libusb's hotplug machinery is dead weight in this
-     * build. */
+    /* A dedicated context, so that a long playback session and a detection
+     * scan on another device never share libusb state. NO_DEVICE_DISCOVERY
+     * because this library never enumerates: an unprivileged Android app
+     * cannot read /dev/bus/usb, and the device comes from wrapping the fd. */
     struct libusb_init_option init_opts[] = {
         { .option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY },
     };
@@ -464,15 +345,8 @@ static int laser_register(int fd)
         goto err_ctx;
     }
 
-    /* Identify the hardware as early as possible - right after the
-     * handle exists, before anything that can fail in a
-     * device-specific way. Every log line from here on can then name
-     * the device, which is what makes a user's logcat actionable: "no
-     * bulk endpoint pair found" tells us nothing on its own, while the
-     * same message next to a vid:pid:bcd is a reproducible report and,
-     * if it ever comes to that, the exact key a per-device workaround
-     * would match on. The descriptor is cached by libusb, so this
-     * costs no bus traffic. */
+    /* The USB identity, read early so that every later log line can name the
+     * device. The descriptor is cached: no bus traffic. */
     struct libusb_device_descriptor desc;
     if (libusb_get_device_descriptor(libusb_get_device(entry->handle),
                                      &desc) == LIBUSB_SUCCESS) {
@@ -486,12 +360,8 @@ static int laser_register(int fd)
     int speed = libusb_get_device_speed(libusb_get_device(entry->handle));
     LOGI("register(fd=%d): link speed %d (%s)", fd, speed, speed_name(speed));
 
-    /* Interface selection comes FIRST, before anything is claimed: which
-     * interface to claim is its result, not its precondition. Reading the
-     * configuration descriptor requires no claim, and claiming interface 0
-     * up front would be exactly the assumption that breaks on a device whose
-     * mass-storage function is not listed first. See
-     * laser_find_bulk_endpoints() for the full rationale. */
+    /* Choose the interface before claiming it: interface 0 is not assumed
+     * (see laser_find_bulk_endpoints()). */
     if (laser_find_bulk_endpoints(entry) < 0) {
         LOGW("register(fd=%d, usb %04x:%04x bcd %04x): no usable Bulk-Only "
              "mass storage interface - not an optical drive?",
@@ -499,47 +369,20 @@ static int laser_register(int fd)
         goto err_handle;
     }
 
-    /* DETACHED BY HAND, AND NEVER GIVEN BACK.
+    /* Detached by hand rather than with libusb's auto-detach, which
+     * re-attaches on release. On kernels that bind usb-storage/sr to an
+     * optical drive and mount the disc, re-attaching at each teardown lets the
+     * kernel start its own conversation with a drive we are about to claim
+     * again, and two initiators on one Bulk-Only device fail each other. So a
+     * drive we keep stays detached until it is unplugged, invisible to the
+     * rest of the system meanwhile.
      *
-     * libusb_set_auto_detach_kernel_driver() would do the detaching in one
-     * line and was what this used to call. It also RE-ATTACHES the kernel
-     * driver when the interface is released, and that half is what could not
-     * stay.
+     * If "kernel driver attached" is logged on every registration while the
+     * device stays plugged in, the re-bind comes from usbfs re-probing when
+     * the fd is closed, not from libusb.
      *
-     * On an Android build whose kernel binds usb-storage/sr to an optical
-     * drive and mounts the disc - older devices do; the phones this was first
-     * written against do not - re-attaching on every teardown hands the drive
-     * straight back to the kernel, which re-binds, re-mounts, and starts its
-     * own conversation with it. The next registration then detaches it
-     * mid-transfer, and two initiators end up alternating on one Bulk-Only
-     * device that can only serve one. Observed as: the first classification
-     * of a session works, and every later one costs two Reset Recoveries and
-     * three INQUIRY attempts before the drive answers, with the disc walk
-     * that follows failing on a drive that has not settled - while
-     * ACTION_MEDIA_UNMOUNTED for sr0 arrives, from the kernel, in the middle
-     * of our own registration.
-     *
-     * So the interface is taken once and kept for as long as the device is
-     * plugged in. THE COST IS DELIBERATE AND WORTH NAMING: on such a device
-     * the drive stops being visible to the rest of the system - no
-     * /storage/sr0 for the file manager or anything else - until it is
-     * physically unplugged, at which point the kernel re-binds on its own.
-     * Nothing is lost on a device that never mounted it in the first place.
-     *
-     * THIS MAY NOT BE THE ONLY THING RE-BINDING THE DRIVER, and the log line
-     * below is what tells. usbfs re-probes the interfaces a process
-     * disconnected when that process closes the device fd - and every
-     * classification does close it, since the Java side opens a fresh
-     * UsbDeviceConnection per pass. If "kernel driver attached" keeps
-     * appearing on registrations after the first while a device stays
-     * plugged in, then the re-bind is coming from that fd close rather than
-     * from libusb, this change is not sufficient on its own, and the fix is
-     * to stop tearing the registration down between classifications. If it
-     * appears only once per plug-in, this was the whole of it.
-     *
-     * Not fatal on failure: if the driver cannot be detached, the claim below
-     * fails with LIBUSB_ERROR_BUSY and reports it in its own terms, and one
-     * error is better told there than guessed at here. */
+     * Not fatal: if the detach fails, the claim below fails with
+     * LIBUSB_ERROR_BUSY and says so. */
     ret = libusb_kernel_driver_active(entry->handle, entry->iface_num);
     if (ret == 1) {
         LOGI("register(fd=%d): kernel driver attached on interface %u, "
@@ -568,91 +411,45 @@ static int laser_register(int fd)
         goto err_handle;
     }
 
-    /* Normalize BOT state before any SCSI command is sent - see this
-     * function's doc comment in laser_internal.h. */
+    /* Put the BOT state machine in a known state before any SCSI command. */
     laser_mass_storage_reset(entry);
 
-    /* Which logical unit is the optical drive, and is it one at all? Must
-     * come after the reset and after io_lock exists, since it takes it.
-     * Always leaves entry->lun usable, even on failure.
-     *
-     * ONE CALL ANSWERING BOTH: choosing the unit and classifying it are the
-     * same question asked once, and splitting them would mean re-issuing the
-     * very INQUIRY the choice was made on.
-     *
-     * Combo enclosures expose their card reader as a second Mass Storage /
-     * Bulk-Only / SCSI device, identical to a drive in every USB descriptor,
-     * so one reaches this point as a candidate and there is no way to tell
-     * from the bus alone. INQUIRY tells, and tells immediately.
-     *
-     * Runs BEFORE the spin-up wait, which is a change of order from the
-     * obvious one and is deliberate: GET MAX LUN and INQUIRY are answered
-     * whatever the tray holds, so nothing here needs a medium, and putting
-     * them first is what lets a card reader be declined for the price of one
-     * command instead of a whole spin-up budget - on every browse. */
+    /* Which LUN is the optical drive, and is there one at all? Needs no
+     * medium, so it runs before the spin-up wait: the card reader of a combo
+     * enclosure, identical to a drive in its USB descriptors, is declined for
+     * one INQUIRY instead of a whole spin-up budget. */
     int optical = laser_probe_lun(entry);
 
     if (optical == LASER_OPTICAL_NO) {
         LOGI("register(fd=%d, usb %04x:%04x): not an optical drive, "
              "declining", fd, entry->vid, entry->pid);
-        ret = LIBUSB_ERROR_NOT_SUPPORTED;
         goto err_iface;
     }
 
-    /* The device left the bus while we were probing it. Declining is the only
-     * honest answer: every field this entry would carry - endpoints, LUN,
-     * interface - describes something that is no longer there, and publishing
-     * it means each consumer that looks the token up pays a failed transfer
-     * to discover what is already known here. The same drive plugged back in
-     * arrives as a new descriptor and a new token, so there is nothing to
-     * keep this one for. */
+    /* The device left the bus during setup: nothing left to keep. */
     if (optical == LASER_OPTICAL_GONE) {
         LOGW("register(fd=%d, usb %04x:%04x): device left the bus during "
              "setup, declining", fd, entry->vid, entry->pid);
-        ret = LIBUSB_ERROR_NO_DEVICE;
         goto err_iface;
     }
 
-    /* A device that answered nothing is DECLINED, and this used to register
-     * it anyway on the reasoning that silence is not proof it is the wrong
-     * kind of device. That was defensible while the kernel driver came back
-     * on release. It stopped being so when the detach became permanent.
-     *
-     * Registering it means holding its interface for as long as it stays
-     * plugged in - a device we could not identify, cannot read, and are not
-     * going to serve a single useful command from. Worse, the kernel is the
-     * only agent that can properly reset such a device, and holding the
-     * interface is exactly what stops it: observed as a drive that stayed
-     * unusable until it was physically unplugged, no matter how many times
-     * classification was retried.
-     *
-     * Declining costs nothing a caller notices - the device failed every
-     * read either way - and buys the one thing that helps: usb-storage gets
-     * it back through the unwind ladder below, re-probes it, and the next
-     * classification starts from a device the kernel has reset rather than
-     * one we have been sitting on. */
+    /* A device that answers no INQUIRY is declined too. Keeping it would keep
+     * its interface away from the kernel for as long as it stays plugged in,
+     * and the kernel is the only agent able to reset it. */
     if (optical == LASER_OPTICAL_NO_ANSWER) {
         LOGW("register(fd=%d, usb %04x:%04x): INQUIRY unanswered on every "
              "unit, declining and handing the device back to the kernel - it "
              "is most likely still busy with work started before this claim",
              fd, entry->vid, entry->pid);
-        ret = LIBUSB_ERROR_IO;
         goto err_iface;
     }
 
-    /* Spin the drive up and wait for its medium before anything tries to
-     * read it. A cold optical drive answers the first data command with
-     * NOT READY / becoming-ready and, on some firmware, a READ that
-     * arrives before spin-up fails outright rather than starting it - so
-     * this must happen before any classification or playback read. See its
-     * doc comment. */
+    /* Some firmware fails a READ that arrives before spin-up instead of
+     * starting it, so wait before anything reads. */
     laser_wait_until_ready(entry);
 
-    /* Publish. Everything this entry needs is now in place, so from here
-     * laser_lookup() may hand it out - and not one line before, which is the
-     * whole reason a single flag is enough. Done under the table lock so that
-     * a thread which observes in_use == 1 also observes every field written
-     * above it. */
+    /* Publish, last and under the table lock, so that whoever sees
+     * in_use == 1 also sees every field written above. */
     pthread_mutex_lock(&g_table_lock);
     entry->in_use = 1;
     pthread_mutex_unlock(&g_table_lock);
@@ -663,34 +460,13 @@ static int laser_register(int fd)
          entry->iface_num, entry->ep_in, entry->ep_out, entry->lun);
     return 0;
 
-    /* Unwind ladder, in exact reverse order of acquisition. Each error
-     * above jumps to the label matching the LAST thing it managed to
-     * acquire, and falls through the rest.
-     *
-     * err_iface exists for the one failure that can happen after the claim
-     * succeeded: declining a device that INQUIRY says is not an optical
-     * drive. Everything before that point fails with no interface held and
-     * enters the ladder lower down, which is why this link had no reason to
-     * exist until that check was added. */
+    /* Unwind ladder, in reverse order of acquisition. err_iface serves the
+     * only failures after the claim: the declines above. */
     err_iface:
     libusb_release_interface(entry->handle, entry->iface_num);
     err_handle:
-    /* GIVE THE KERNEL ITS DRIVER BACK ON EVERY PATH THAT DOES NOT KEEP THE
-     * DEVICE - and the path that matters is the ordinary one, not an error.
-     *
-     * The interface has to be claimed before INQUIRY can say what the device
-     * is, so a USB key reaches this point with usb-storage already detached
-     * and is then declined for not being an optical drive. Leaving it
-     * detached would take the user's flash drive away from the system
-     * entirely, every time the browser classifies it, for no benefit
-     * whatsoever - this library has already established it wants nothing to
-     * do with the device.
-     *
-     * A drive we DO keep is a different matter and is handled elsewhere: it
-     * is never re-attached, because handing it back between classifications
-     * lets the kernel re-bind, re-mount and start its own conversation with
-     * a drive we are about to claim again, and two initiators on one
-     * Bulk-Only device is what that costs. See the detach above. */
+    /* A declined device gets its kernel driver back - typically a USB key,
+     * which the claim detached before INQUIRY could tell what it was. */
     reattach_kernel_driver(entry);
     libusb_close(entry->handle);
     err_ctx:
@@ -706,104 +482,53 @@ static int laser_register(int fd)
     return -1;
 }
 
-/** Serializes every mutation of the registry: registration, including the
- * expensive USB setup inside laser_register(), and teardown.
- *
- * NOT the same thing as g_table_lock, which is deliberately kept fast, is
- * taken for a handful of instructions at a time, and is what every lookup on
- * the transaction path uses. This one is held for as long as a registration
- * takes - up to fifteen seconds on a drive spinning up - and must therefore
- * never be on that path.
- *
- * Two jobs, both now belonging to laser_acquire() and laser_release():
- *
- *   - a second consumer arriving for the same token mid-registration BLOCKS
- *     here until the first is done, and then finds the finished entry on its
- *     re-check. Without it, both would find nothing, both would register, and
- *     one would lose its slot;
- *   - a teardown cannot interleave with a registration still in progress.
- *
- * It also makes "register if needed, then take the claim" a single atomic
- * step, which it was not when registration had its own entry point: the
- * sequence took this lock, dropped it, and took it again to count, and a
- * release landing in that gap could tear the entry down between the two
- * halves. The caller then incremented refs on a slot that had just been
- * memset - or, worse, one already handed to a different fd.
- *
- * Renamed TO g_registry_lock when the lazy path its previous name referred
- * to was removed: it guards registration, not a special case of it. */
+/** Serializes registration - including its slow USB setup, up to fifteen
+ * seconds - and teardown, and makes "register if needed, then count the
+ * claim" one atomic step. Never taken on the transaction path, unlike
+ * g_table_lock. */
 static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---------------------------------------------------------------------------
  * CSS authentication sessions - contract in laser.h.
  *
- * LOCK ORDER. Three nestings occur, and all three have g_registry_lock on
- * the outside:
+ * LOCK ORDER. Every nesting has g_registry_lock outside:
  *
- *     g_registry_lock  >  io_lock        (setup: LUN probe, spin-up wait)
+ *     g_registry_lock  >  io_lock        (setup, and teardown's drain)
  *     g_registry_lock  >  css_mtx        (teardown: is a session open?)
  *     g_registry_lock  >  g_table_lock   (publish an entry, release a slot)
  *
- * The other three pairs never nest AT ALL, in either direction, and that is
- * a stronger property than an order between them - so do not read the list
- * above as a chain and infer, say, that css_mtx may be taken under io_lock.
- * Nothing does that, and nothing should start.
- *
- * The pair worth naming is css_mtx and io_lock, because one call touches
- * both: laser_scsi_cdb() takes css_mtx for the session check and RELEASES
- * it before locking io_lock. Likewise begin() finishes its lookup - which
- * may take g_registry_lock - before touching css_mtx. A session being
- * "open" for hours is a flag, not a held lock, which is what lets it
- * outlive any single call.
+ * No other pair nests, in either direction. laser_scsi_cdb() releases css_mtx
+ * after its session check, before taking io_lock. An open session is a flag,
+ * not a held lock.
  * ------------------------------------------------------------------------- */
 
 int laser_cdb_changes_css_state(const uint8_t *cdb, int cdb_len)
 {
-    /* All key-class CDBs are 12 bytes; anything shorter cannot be one, and
-     * reading cdb[10] on it would be out of bounds. */
+    /* All key-class CDBs are 12 bytes; reading cdb[10] on a shorter one would
+     * be out of bounds. */
     if (cdb_len < 12)
         return 0;
 
     switch (cdb[0]) {
     case 0xA4: { /* REPORT KEY - format in byte 10, bits 5:0 */
         const uint8_t fmt = cdb[10] & 0x3f;
-        /* AGID(00) allocates one of the drive's four; challenge(01) and
-         * key1(02) advance the handshake; title key(04) is session-scoped and
-         * bus-key-encrypted; invalidate(3F) destroys the session. ASF(05) and
-         * RPC state(08) only report, and libdvdcss reads RPC state before any
-         * AGID exists - refusing those would disable CSS for the whole disc
-         * rather than protect anything. */
+        /* AGID(00), challenge(01), key1(02), title key(04) and
+         * invalidate(3F) change state. ASF(05) and RPC state(08) only report,
+         * and libdvdcss reads RPC state before any AGID exists. */
         return fmt == 0x00 || fmt == 0x01 || fmt == 0x02 ||
                fmt == 0x04 || fmt == 0x3f;
     }
     case 0xA3: { /* SEND KEY - format in byte 10, bits 5:0 */
         const uint8_t fmt = cdb[10] & 0x3f;
-        /* challenge(01) and key2(03) are handshake steps. RPC region set(06)
-         * is not, and is not something this project ever issues. */
+        /* challenge(01) and key2(03). RPC region set(06) is never issued. */
         return fmt == 0x01 || fmt == 0x03;
     }
     case 0xAD: /* READ DVD STRUCTURE - format in byte 7 */
-        /* WHITELIST, not a list of the state-changing ones, and the only
-         * opcode here treated that way. The others have a closed set of
-         * formats this project issues; ADh does not - libdvdcpxm added CPRM's
-         * media identifier and media key block reads to this same opcode, both
-         * of which carry an AGID in byte 10 exactly as the disc key does, and
-         * a fourth structure could be added tomorrow.
-         *
-         * So the question asked is the inverse one: is this format known to
-         * need NO authentication? Physical(00) and copyright(01) are - they
-         * carry no AGID, and dvdcss_test() issues them before any AGID exists,
-         * so refusing them would disable CSS for the whole disc rather than
-         * protect anything. Everything else is assumed to be part of an
-         * authenticated exchange.
-         *
-         * Being wrong conservatively costs a retry that would probably have
-         * been safe; being wrong the other way hands an undeclared consumer
-         * one of the drive's four AGIDs mid-handshake. Note that this does
-         * make every MKB pack read non-retryable, and an MKB is read a pack at
-         * a time - a transient stall there fails the read rather than being
-         * absorbed. That is the price of not having to know, in this file,
-         * every structure format a caller might one day send. */
+        /* Inverted on purpose: only physical(00) and copyright(01) are known
+         * to need no authentication, and dvdcss_test() issues them before any
+         * AGID exists. Every other format - disc key, CPRM's media identifier
+         * and MKB, anything added later - is treated as authenticated, at the
+         * cost of never retrying those reads. */
         return !(cdb[7] == 0x00 || cdb[7] == 0x01);
     default:
         return 0;
@@ -821,11 +546,7 @@ int laser_css_session_is_open(laser_entry_t *entry)
     return open;
 }
 
-/** Absolute deadline for pthread_cond_timedwait(), on the clock css_cv was
- * created against. Reading LASER_CSS_CLOCK here and there is what keeps the
- * two the same: pthread_cond_timedwait() interprets the timespec on the
- * condvar's own clock, so naming the other one would not fail loudly, it
- * would simply wait for the difference between two epochs. */
+/** Absolute deadline on LASER_CSS_CLOCK, the clock css_cv was created on. */
 static void css_deadline(struct timespec *ts, long ms)
 {
     clock_gettime(LASER_CSS_CLOCK, ts);
@@ -844,11 +565,7 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
         return LASER_ERR_IO;
     }
 
-    /* lookup(), like every entry point that is not laser_acquire(): a session
-     * on a device nobody has claimed is a lifecycle bug in the caller, and
-     * this says so rather than registering a drive on its behalf. libdvdcss
-     * acquires immediately before calling this - see the patch's
-     * dvdcss_open(). */
+    /* A session needs a claim; begin() registers nothing. */
     laser_entry_t *entry = laser_lookup(token);
     if (entry == NULL) {
         LOGW("css_session_begin(token=%d): not registered - no claim held?",
@@ -863,8 +580,7 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
 
     while (entry->css_open) {
         if (entry->css_owner == owner) {
-            /* Re-entrant begin() by the same consumer. Waiting would deadlock
-             * against itself, so it is reported rather than hung on. */
+            /* Re-entrant begin() by the same owner would wait on itself. */
             pthread_mutex_unlock(&entry->css_mtx);
             LOGE("css_session_begin(token=%d, usb %04x:%04x): this owner "
                  "already holds the session", token, entry->vid, entry->pid);
@@ -873,10 +589,8 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
         if (pthread_cond_timedwait(&entry->css_cv, &entry->css_mtx,
                                    &deadline) == ETIMEDOUT) {
             pthread_mutex_unlock(&entry->css_mtx);
-            /* A timeout here is a LEAK, not contention: a whole disc's key
-             * work is orders of magnitude shorter than the ceiling. Named as
-             * such, because the symptom - CSS quietly unavailable - otherwise
-             * points nowhere. */
+            /* A whole disc's key work is far shorter than the ceiling, so a
+             * timeout means a leaked session, not contention. */
             LOGE("css_session_begin(token=%d, usb %04x:%04x): no session after "
                  "%d ms - another consumer is holding one and has probably "
                  "leaked it; CSS unavailable for this attempt",
@@ -895,8 +609,7 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
 
 void laser_css_session_end(int token, const void *owner)
 {
-    /* A session cannot exist on an unregistered token, so a miss here is a
-     * caller-lifecycle bug and is reported as one. */
+    /* A session cannot exist on an unregistered token. */
     laser_entry_t *entry = laser_lookup(token);
     if (entry == NULL) {
         LOGW("css_session_end(token=%d): not registered", token);
@@ -916,29 +629,33 @@ void laser_css_session_end(int token, const void *owner)
     pthread_mutex_unlock(&entry->css_mtx);
 }
 
-/** Tear an entry down. Caller MUST hold g_registry_lock, and the last
- * claim on the entry must already be gone. */
+/** Tear an entry down. Caller MUST hold g_registry_lock; the last claim must
+ * be gone and the entry already cancelled.
+ *
+ * io_lock is held while the device is reset and the handle closed. A
+ * transaction in flight on another thread therefore completes first - within
+ * about one phase timeout, since the cancellation stops its retries - and a
+ * thread queued on io_lock only gets it after the close, sees the
+ * cancellation and returns without touching libusb. A thread that still uses
+ * the entry after release_slot() remains the caller's to prevent, as laser.h
+ * says. */
 static void teardown_entry_locked(laser_entry_t *entry)
 {
     int token = entry->token;
 
+    pthread_mutex_lock(&entry->io_lock);
+
     if (!entry->device_gone)
         laser_mass_storage_reset(entry);
 
-    /* See the threading contract in laser.h: the caller guarantees no
-     * transaction is in flight on this token any more by the time the last
-     * claim is dropped, so it is safe to tear down without acquiring
-     * entry->io_lock here. */
     libusb_release_interface(entry->handle, entry->iface_num);
     libusb_close(entry->handle);
     libusb_exit(entry->ctx);
 
-    /* The public contract covers TRANSACTIONS, which is what licenses tearing
-     * down without taking io_lock. It says nothing about SESSIONS, and cannot:
-     * a session spans several transactions, so "no transaction in flight" is
-     * true at every gap between two steps of a live handshake. So this one is
-     * checked. A fired warning means a consumer outlived the teardown of the
-     * device it was authenticating against - a real bug, worth naming. */
+    pthread_mutex_unlock(&entry->io_lock);
+
+    /* A session spans several transactions, so draining io_lock says nothing
+     * about it: one still open means a consumer outlived the device. */
     if (laser_css_session_is_open(entry)) {
         LOGE("release(token=%d, usb %04x:%04x): a CSS session is still open "
              "at teardown - a consumer is authenticating against a device "
@@ -953,12 +670,16 @@ static void teardown_entry_locked(laser_entry_t *entry)
     LOGI("release(token=%d): device torn down", token);
 }
 
-/* Does @p fd still name what this entry was registered on?
- *
- * See laser_entry_t::reg_dev. */
+/* Does @p fd still name the device this entry was registered on? See
+ * laser_entry_t::reg_dev. An identity fstat() could not record at
+ * registration is trusted, rather than refusing every later claim. */
 static int fd_still_ours(const laser_entry_t *entry, int fd)
 {
     struct stat st;
+
+    if (entry->reg_dev == 0 && entry->reg_ino == 0) {
+        return 1;
+    }
 
     if (fstat(fd, &st) != 0) {
         return 0;
@@ -969,23 +690,16 @@ static int fd_still_ours(const laser_entry_t *entry, int fd)
 
 laser_status_t laser_acquire(int token)
 {
-    /* ONE CRITICAL SECTION, covering the lookup, the registration if there
-     * has to be one, and the increment. Not an optimisation - a correctness
-     * requirement. Dropping the lock between the lookup and the increment
-     * would let a release land in the gap, take another consumer's claim to
-     * zero and tear the entry down between the two halves, leaving this
-     * function to increment refs on a slot that had just been memset, or on
-     * one already reserved for a different fd. */
+    /* One critical section for lookup, registration and increment: a release
+     * landing between lookup and increment could tear the entry down in the
+     * gap. */
     pthread_mutex_lock(&g_registry_lock);
 
     laser_entry_t *entry = laser_lookup(token);
 
-    /* The descriptor may have been recycled since this entry was registered.
-     * REFUSED RATHER THAN RE-REGISTERED, which is the only safe answer here:
-     * an entry exists only while somebody holds it, so a mismatch means
-     * another consumer still believes it holds this device, and tearing its
-     * registration down to build a new one under the same number would take
-     * the drive away from a caller that never let go. */
+    /* An entry lives only while somebody holds it, so a descriptor that no
+     * longer names its device means a claim was never released. Refused:
+     * re-registering would take the drive from a consumer that never let go. */
     if (entry != NULL && !fd_still_ours(entry, token)) {
         pthread_mutex_unlock(&g_registry_lock);
         LOGE("acquire(token=%d): the descriptor no longer names the device "
@@ -994,9 +708,6 @@ laser_status_t laser_acquire(int token)
     }
 
     if (entry == NULL) {
-        /* Result checked via the lookup rather than the return value: what
-         * matters to this function is whether an entry exists afterwards, and
-         * laser_register() has exactly one success shape. */
         laser_register(token);
         entry = laser_lookup(token);
     }
@@ -1020,12 +731,9 @@ laser_status_t laser_acquire(int token)
 
 void laser_release(int token)
 {
-    /* Held across the whole decision, not just the decrement: whether this
-     * call tears the device down and the teardown itself have to be one
-     * atomic step, or two consumers releasing at the same time could both see
-     * the count reach zero. It is also the lock that keeps a teardown from
-     * interleaving with a registration still in progress - see the comment on
-     * g_registry_lock. */
+    /* Held across the decision and the teardown, so that two concurrent
+     * releases cannot both see the count reach zero, and so that a teardown
+     * cannot interleave with a registration. */
     pthread_mutex_lock(&g_registry_lock);
 
     laser_entry_t *entry = laser_lookup(token);
@@ -1036,11 +744,8 @@ void laser_release(int token)
     }
 
     if (entry->refs <= 0) {
-        /* Unbalanced: more releases than acquires. Logged rather than acted
-         * on, because the alternative - tearing down anyway - is exactly the
-         * "first one out wins" behaviour the count exists to remove. The
-         * device stays up, some other consumer's claim keeps it alive, and
-         * the bug is named where it can be found. */
+        /* More releases than acquires. Tearing down anyway would take the
+         * device from the consumers still holding it; name the bug instead. */
         pthread_mutex_unlock(&g_registry_lock);
         LOGE("release(token=%d, usb %04x:%04x): no claim held by anyone - "
              "unbalanced release, ignored", token, entry->vid, entry->pid);
@@ -1055,22 +760,10 @@ void laser_release(int token)
         return;
     }
 
-    /* Last claim gone: this device is on its way out. Raise the cancellation
-     * flag BEFORE tearing anything down.
-     *
-     * THIS IS WHERE CANCELLATION LIVES, and not in an entry point a consumer
-     * could call. The flag is sticky and token-wide, while a claim is one of
-     * several: on a DVD libdvdcss holds the same token, so one consumer
-     * cancelling would disable the drive for the others with no way to clear
-     * it. Arriving here means "the last consumer is done", which is the only
-     * moment at which a token-wide statement is true.
-     *
-     * What it buys, set from here: the public contract says no
-     * transaction may be in flight when the last claim is dropped, and
-     * nothing here can enforce that. A thread that legitimately took its
-     * entry pointer before this call began now sees the flag and abandons its
-     * remaining attempts, instead of spending a six-attempt budget on a
-     * handle that is about to close. */
+    /* Last claim gone. Cancel first, so that an operation still running on
+     * another thread abandons its remaining attempts, then tear down. The
+     * flag is sticky and token-wide, which is why only the last release may
+     * raise it. */
     laser_set_cancelled(entry);
 
     teardown_entry_locked(entry);
