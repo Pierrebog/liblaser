@@ -159,10 +159,10 @@ which of the three paths above is taken:
 
 | MRL                                                                                      | Purpose                                                                                                                                                                                                                                                                                                  |
 |------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `file://laser/<fd>`                                                                      | Classification. The `file` scheme is borrowed because the preparser types items from a fixed scheme table and never opens a module for a scheme it does not know.                                                                                                                                   |
-| `laser/dvd://<fd>`, `laser/dvdsimple://<fd>`, `laser/dvda://<fd>`, `laser/bluray://<fd>` | Video and DVD-Audio playback. libVLC reads this as access `laser` plus a demuxer name. A DVD-Video is offered under two of them — with menus and without — and a universal disc under `dvda` and `dvd`, one per zone, told apart by their icon alone.                                               |
-| `cdda://laser/<fd>`                                                                      | CD-Audio. Here the drive is the URI's *authority*, not the access module: `cdda` is an access_demux and reaches the contrib itself. It expands into one MRL per track, `…/Track%20NN`.                                                                                                              |
-| `vcd://laser/<fd>`, `svcd://laser/<fd>`                                                  | Video CD and Super Video CD. Same shape and same reason as the line above — the drive is the authority, and `vcd` reaches the contrib through the same `cdrom.c` as `cdda`. A Video CD is a *video* disc that stays on the *CD* path, because what decides the path is the sector, not the content. |
+| `file://laser/<fd>`                                                                      | Classification. The `file` scheme is borrowed because the preparser types items from a fixed scheme table and never opens a module for a scheme it does not know.                                                                                                                                        |
+| `laser/dvd://<fd>`, `laser/dvdsimple://<fd>`, `laser/dvda://<fd>`, `laser/bluray://<fd>` | Video and DVD-Audio playback. libVLC reads this as access `laser` plus a demuxer name. A DVD-Video is offered under two of them — with menus and without — and a universal disc under `dvda` and `dvd`, one per zone, told apart by their icon alone.                                                    |
+| `cdda://laser/<fd>`                                                                      | CD-Audio. Here the drive is the URI's *authority*, not the access module: `cdda` is an access_demux and reaches the contrib itself. It expands into one MRL per track, `…/Track%20NN`.                                                                                                                   |
+| `vcd://laser/<fd>`, `svcd://laser/<fd>`                                                  | Video CD and Super Video CD. Same shape and same reason as the line above — the drive is the authority, and `vcd` reaches the contrib through the same `cdrom.c` as `cdda`. A Video CD is a *video* disc that stays on the *CD* path, because what decides the path is the sector, not the content.      |
 
 Two asymmetries in the diagram are worth reading twice. The `dvd` and `bluray`
 demuxers get their **blocks** from the access module, not from the contrib —
@@ -187,7 +187,7 @@ being video, sits beside the audio CD rather than beside the DVD.
                               v  registry.c - see below
  ┌────────────────┐   ┌────────────────┐
  │   registry.c   │   │     disc.c     │  what is in the drive:
- │                │   └────────────────┘  TOC, then UDF, then ISO9660
+ │                │   └────────────────┘  profile, TOC, ISO9660, UDF
  │  tokens and    │           │
  │  claims, CSS   │           v
  │  session,      │   ┌────────────────┐
@@ -250,7 +250,7 @@ so that a device torn down between two commands is discovered at the next one
 instead of dereferenced. And `bot.c` calls `laser_mass_storage_reset()` in
 `usb.c` directly, for Reset Recovery: that request is a class request on the
 interface rather than a command on the bulk pipes, so it belongs to the USB
-layer even though only the transport layer ever needs it. Note what that
+layer, beside the registration and teardown that use it too. Note what that
 arrow does *not* carry: `bot.c`'s bulk transfers go straight to libusb, so the
 only thing crossing from `bot.c` into `usb.c` is the reset.
 
@@ -263,7 +263,7 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
   MMC commands of its own — the Volume ID above all — which a stream cannot
   carry. Making those discs play means giving libaacs the treatment libdvdcss
   got: a device handle routed through the contrib, plus the equivalent of the
-  [CSS](#7-acronyms) session exclusion. This is a chantier on the scale of the whole CSS
+  CSS session exclusion. This is a chantier on the scale of the whole CSS
   effort, not a wiring job, and it is unchanged by the patch below — which
   deliberately touches no MMC code.
 
@@ -277,10 +277,10 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
   latched as scrambled before CSS engaged stays latched for the session. The
   clean fix is a generation counter on the CSS session, sampled on each read.
   Rarely reachable in practice, since authentication happens during open.
-- **Video CD in a later session.** The ISO9660 walk now addresses the *track*:
-  it reads sector 16 relative to the first data track's start [LBA](#7-acronyms), taken from
-  the table of contents step 1 has already fetched, so it costs no extra
-  command. What is still out of reach is a filesystem living in a later
+- **Video CD in a later session.** The ISO9660 walk finds the PVD at sector 16
+  of the first data track, whose start LBA comes from the table of contents
+  already fetched, at no extra command; the extents in it are absolute, as
+  multi-session mastering writes them. What is still out of reach is a filesystem living in a later
   *session* of a multi-session disc — format 0 of `READ TOC` reports tracks,
   not sessions, so finding the last session's first track needs format `01h`,
   a second command. Such a disc yields "unrecognised" rather than a wrong
@@ -351,7 +351,7 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
   free.
   <https://ecma-international.org/publications-and-standards/technical-reports/ecma-tr-71/>
 - **ECMA-167, *Volume and file structure … non-sequential recording*** (3rd ed.;
-  ISO/IEC 13346) — the normative base for [UDF](#7-acronyms). Free.
+  ISO/IEC 13346) — the normative base for UDF. Free.
   <https://ecma-international.org/publications-and-standards/standards/ecma-167/>
 - **[OSTA](#7-acronyms) UDF** — 1.02 is the profile a DVD-Video actually requires, in
   UDF/ISO 9660 bridge form, which is why an ECMA-119 (ISO 9660) structure is
@@ -382,22 +382,34 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
 | Acronym      | Meaning |
 | ------------ | ------- |
 | AACS         | Advanced Access Content System. Blu-ray's content protection, implemented by libaacs. |
+| ABI          | Application Binary Interface. Which machine code an Android device will load. |
+| AGID         | Authentication Grant ID. The handle a drive issues for one CSS handshake; a drive has four and leaks them if a request is retried. |
+| AMG          | Audio Manager. The DVD-Audio zone's `AUDIO_TS.IFO`, identified by its `DVDAUDIO-AMG` magic. |
 | ASC / ASCQ   | Additional Sense Code and its Qualifier. The two bytes that say what a SCSI command actually failed on; the sense key alone rarely does. |
 | BBB          | Bulk/Bulk/Bulk. The USB Mass Storage specification's own name for Bulk-Only Transport, and the reason its protocol code is what it is. |
 | BOT          | Bulk-Only Transport. The USB Mass Storage transport this library speaks, and what `bot.c` is named after. |
 | CBW / CSW    | Command Block Wrapper and Command Status Wrapper. The header that carries a CDB out and the trailer that reports what happened, one pair per transaction. |
 | CDB          | Command Descriptor Block. The SCSI command itself, 6 to 16 bytes, riding inside a CBW. |
+| CD-DA        | Compact Disc Digital Audio. Red Book audio: no filesystem, hence no volume label. |
+| CPPM         | Content Protection for Prerecorded Media. DVD-Audio's scheme, and unlike CSS it adds no SCSI command. |
+| CPXM         | CPPM and CPRM taken together — the name the libdvdcss fork uses for the implementation behind `dvdcpxm.h`. |
 | CSS          | Content Scramble System. DVD-Video's protection. Nothing to do with stylesheets. |
+| EDC / ECC    | Error Detection Code and Error Correction Code. The trailer on a raw CD sector, and the reason a raw read can come back 2072 or 2348 bytes instead of 2352. |
+| IFO          | The DVD "information" file extension — `VIDEO_TS.IFO` and friends, unscrambled even on a protected disc. |
 | LBA          | Logical Block Address. A sector number, counted from the start of the medium unless something says otherwise. |
 | LUN          | Logical Unit Number. Which unit behind one USB device a command is addressed to; an optical drive is rarely LUN 0 on a multi-slot bridge. |
 | MMC          | Multi-Media Commands. The SCSI command set for optical drives. Not MultiMediaCard, which is a different thing entirely. |
 | MRL          | Media Resource Locator. VLC's URI-like string naming both what to open and which module opens it. |
 | OSTA         | Optical Storage Technology Association. Publishes UDF. |
 | PTP / OTP    | Parallel Track Path and Opposite Track Path. Which direction the second layer of a dual-layer DVD is read in. |
+| PVD          | Primary Volume Descriptor. ISO9660's volume header, holding the root directory record, at sector 16 of the track carrying the filesystem. |
+| RPC          | Region Playback Control. RPC-1 names a drive that enforces no region itself. |
 | SBC / SPC    | SCSI Block Commands and SCSI Primary Commands. The two command sets MMC sits on top of. |
 | SCSI         | Small Computer System Interface. The command language, still spoken by every optical drive whatever it is plugged into. |
 | T10 / INCITS | The technical committee that publishes the SCSI standards, and the body it belongs to. |
-| TOC          | Table of Contents. A CD's track list, read with one command and the only cheap way to know a medium is a CD. |
+| TOC          | Table of Contents. A CD's track list, read with one command. Drives make one up for a DVD or a BD, so it says what a CD holds, not whether the medium is one. |
 | UDF          | Universal Disk Format. The filesystem on every DVD and Blu-ray, and the one libdvdread actually reads. |
 | VCD / SVCD   | Video CD and Super Video CD. MPEG-1 and MPEG-2 video on a CD, read through ISO9660. |
+| VMG          | Video Manager. The DVD-Video zone's `VIDEO_TS.IFO`, identified by its `DVDVIDEO-VMG` magic. |
+| VOB          | Video Object. A DVD-Video payload file, and the part of the disc that is scrambled. |
 | VUK          | Volume Unique Key. The per-disc key AACS derives before anything can be decrypted. |

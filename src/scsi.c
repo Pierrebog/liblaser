@@ -427,8 +427,9 @@ static void log_media_status_locked(laser_entry_t *entry)
  * LASER_NO_MEDIUM_MAX_WALL_MS; everything else under LASER_SPINUP_MAX_WALL_MS
  * and LASER_SPINUP_MAX_ATTEMPTS.
  *
- * Not cancellable, and it need not be: it runs inside laser_acquire(), under
- * g_registry_lock, on an entry not yet published. */
+ * Not cancellable. At registration it runs inside laser_acquire(), under
+ * g_registry_lock, on an entry not yet published; laser_token_settle() may
+ * run it again on a published one. */
 void laser_wait_until_ready(laser_entry_t *entry)
 {
     struct timespec started;
@@ -560,6 +561,27 @@ void laser_wait_until_ready(laser_entry_t *entry)
     LOGW("token=%d: drive did not become ready after %ldms, proceeding anyway",
          entry->token, monotonic_ms_since(&started));
     pthread_mutex_unlock(&entry->io_lock);
+}
+
+/* See laser_internal.h. The sense of a failed TEST UNIT READY is left for
+ * the wait, whose first command replaces it: what matters is that the drive
+ * is not ready, not why. */
+void laser_token_settle(int token)
+{
+    laser_entry_t *entry = laser_lookup(token);
+    if (entry == NULL || entry->device_gone || laser_is_cancelled(entry))
+        return;
+
+    pthread_mutex_lock(&entry->io_lock);
+    int rc = test_unit_ready_locked(entry);
+    pthread_mutex_unlock(&entry->io_lock);
+
+    if (rc == 0 || rc == BOT_FAIL_NO_DEVICE)
+        return;
+
+    LOGI("token=%d: registered drive not ready - disc changed or still "
+         "loading, waiting for it", token);
+    laser_wait_until_ready(entry);
 }
 
 /* One INQUIRY on the unit selected by entry->lun, under the probe timeouts:

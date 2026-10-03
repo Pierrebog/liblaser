@@ -215,7 +215,8 @@ typedef struct {
     const void     *css_owner;
 
     /* Raised during laser_wait_until_ready() and cleared when the unit
-     * answers ready, so it remains set only on a drive whose wait ran out.
+     * answers ready, so it remains set only on a drive whose last wait ran
+     * out.
      * Registration succeeds either way; laser_disc_identify() reads it to
      * skip probes that would each spend a retry budget for nothing. */
     int             not_ready;
@@ -287,16 +288,30 @@ void laser_mass_storage_reset(laser_entry_t *entry);
 
 /**
  * Wake the drive and wait for its medium to become ready, before any read.
- * Called once at registration, after laser_probe_lun() has found a unit that
- * answers. Best-effort: a drive that never reports ready is still registered,
- * with laser_entry_t::not_ready left set.
+ * Called at registration, after laser_probe_lun() has found a unit that
+ * answers, and again by laser_token_settle(). Best-effort: a drive that never
+ * reports ready is still registered, with laser_entry_t::not_ready left set.
  *
  * Bounded in real time by LASER_SPINUP_MAX_WALL_MS (15 s), reached only by a
- * drive that has stopped answering; it runs under the registry lock and
- * cannot be cancelled. A working drive, loaded or empty, returns within a few
- * seconds. See scsi.c.
+ * drive that has stopped answering; it cannot be cancelled. A working drive,
+ * loaded or empty, returns within a few seconds. See scsi.c.
  */
 void laser_wait_until_ready(laser_entry_t *entry);
+
+/**
+ * On a token already registered, one TEST UNIT READY, then
+ * laser_wait_until_ready() if the unit is not ready.
+ *
+ * The wait at registration does not cover a disc swapped while the device
+ * stays registered - a paused playback holding it: the new disc may still be
+ * loading, and its UNIT ATTENTION is still pending, which the command layer
+ * reports as LASER_ERR_MEDIA_GONE without retrying. laser_disc_identify()
+ * calls this first, at the cost of one command on a ready drive.
+ *
+ * Does nothing for a token not registered, cancelled, or whose device is
+ * gone.
+ */
+void laser_token_settle(int token);
 
 /** Answers of laser_probe_lun(). */
 enum {

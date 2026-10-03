@@ -85,6 +85,10 @@ typedef struct {
  * drive that never became ready (laser_token_not_ready()), the answer is
  * LASER_DISC_UNKNOWN without contacting the drive.
  *
+ * A drive that is not ready - a disc swapped since the token was registered,
+ * still loading - is first waited for, as laser_acquire() does, for up to
+ * 15 s and without cancellation. A ready drive costs one TEST UNIT READY.
+ *
  * BEST EFFORT, AND NEVER FATAL. @p out is always filled: an unreadable or
  * unrecognised disc yields LASER_DISC_UNKNOWN and an empty volume_id, the
  * same answer as an empty drive.
@@ -123,6 +127,8 @@ typedef struct {
  * THREADING: safe to call concurrently on different tokens. On one token each
  * command is serialized like any other, but the sequence is not atomic: a
  * disc swapped mid-identification most likely yields LASER_DISC_UNKNOWN.
+ * The wait above also consumes the UNIT ATTENTION of a swap, which another
+ * consumer of the token then never sees.
  *
  * @param token the registry token (the fd, see laser.h)
  * @param out   filled on every path; must not be NULL

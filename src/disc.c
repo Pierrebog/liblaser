@@ -29,7 +29,8 @@
 
 #include "laser.h"
 #include "laser_disc.h"
-#include "laser_internal.h"   /* logging; commands go through laser.h only */
+#include "laser_internal.h"   /* logging and laser_token_settle(); commands
+                                * go through laser.h only */
 
 #include <udfread.h>
 #include <blockinput.h>
@@ -689,9 +690,19 @@ void laser_disc_identify(int token, laser_disc_t *out)
     memset(out, 0, sizeof(*out));
 
     /* A drive whose readiness wait ran out would answer every probe below
-     * the same way, each after a full retry budget. */
+     * the same way, each after a full retry budget. Checked before settling
+     * too, so that a drive that just failed its wait at registration is not
+     * made to fail it a second time. */
     if (laser_token_not_ready(token)) {
         LOGI("token=%d: drive never became ready, not probing the disc", token);
+        return;
+    }
+
+    /* The disc may have been swapped since the device was registered. */
+    laser_token_settle(token);
+    if (laser_token_not_ready(token)) {
+        LOGI("token=%d: drive did not become ready, not probing the disc",
+             token);
         return;
     }
 

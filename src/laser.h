@@ -259,9 +259,10 @@ void laser_release(int token);
  * Whether the drive behind @p token ended its readiness wait without ever
  * answering ready.
  *
- * laser_acquire() waits up to 15 s for the medium. A drive that never settled
- * in that time answers every later command the same way, each paying its own
- * retry budget to say so; this says it in one lookup and no command.
+ * laser_acquire() waits up to 15 s for the medium, and laser_disc_identify()
+ * waits again for a drive found not ready. A drive that never settled in that
+ * time answers every later command the same way, each paying its own retry
+ * budget to say so; this says it in one lookup and no command.
  * laser_disc_identify() checks it for that reason.
  *
  * ADVISORY: registration succeeds either way and nothing is refused because
