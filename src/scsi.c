@@ -319,6 +319,10 @@ static int start_stop_unit_locked(laser_entry_t *entry,
  * timeouts.
  *
  *   1.  IMMED, START: the correct request, and the cheapest.
+ *   1b. 06h UNIT ATTENTION: the same request once more. It reports an event
+ *       - a reset, a medium change - not a refusal, and is cleared by being
+ *       reported: a 152d:0583 bridge answers 06h/29h to the first command
+ *       after power-on. Its second answer goes down the ladder below.
  *   2a. 05h/20h INVALID OPCODE: stop. Every other shape is the same opcode.
  *   2b. 05h/24h INVALID FIELD IN CDB: retry without IMMED, the field ATAPI
  *       bridges most often lack. This one may block for the whole spin-up.
@@ -335,8 +339,16 @@ static void spin_up_locked(laser_entry_t *entry)
 {
     uint8_t sense_key, asc, ascq;
 
-    if (start_stop_unit_locked(entry, 1, 0x01,
-                               &sense_key, &asc, &ascq) == USB_BOT_STATUS_PASS) {
+    int status = start_stop_unit_locked(entry, 1, 0x01,
+                                        &sense_key, &asc, &ascq);
+    if (status != USB_BOT_STATUS_PASS &&
+        sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION) {
+        LOGI("token=%d: START STOP UNIT met a UNIT ATTENTION (%02x/%02x), "
+             "sending it again", entry->token, asc, ascq);
+        status = start_stop_unit_locked(entry, 1, 0x01,
+                                        &sense_key, &asc, &ascq);
+    }
+    if (status == USB_BOT_STATUS_PASS) {
         return;
     }
 

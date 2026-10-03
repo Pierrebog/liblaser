@@ -172,10 +172,11 @@ typedef struct {
     uint16_t pid;
     uint16_t bcd_device;
 
-    /* Set once a residue contradicting a full transfer has been logged, so
-     * that a bridge that always gets it wrong is reported once, not on every
-     * read. */
+    /* Set once a residue contradicting a full transfer, or a stalled status
+     * phase, has been logged, so that a bridge that always does it is
+     * reported once, not on every command. */
     int residue_quirk_logged;
+    int csw_stall_quirk_logged;
 
     /** Nonzero while a probe - a command needing no medium, INQUIRY today -
      * is in flight: shortens the BOT phase timeouts. Set and cleared around

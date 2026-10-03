@@ -260,9 +260,16 @@ int laser_bot_send_locked(laser_entry_t *entry,
     if (ret == LIBUSB_ERROR_PIPE) {
         /* BBB 6.7.3 gives a stalled status phase one more chance: clear the
          * halt and read the CSW again. Only a second failure calls for a
-         * Reset Recovery. */
-        LOGW("token=%d: CSW phase stalled, clearing halt and retrying once",
-             entry->token);
+         * Reset Recovery.
+         *
+         * Logged once per device: a 152d:0583 bridge stalls before the CSW
+         * of every failed command, which would fill a spin-up wait with one
+         * line per poll. */
+        if (!entry->csw_stall_quirk_logged) {
+            entry->csw_stall_quirk_logged = 1;
+            LOG_QUIRK(entry, "CSW phase stalled, clearing halt and retrying "
+                             "once (further occurrences not logged)");
+        }
         bot_clear_stall(entry, entry->ep_in);
         ret = libusb_bulk_transfer(entry->handle, entry->ep_in,
                                    csw_buf, USB_BOT_CSW_SIZE, &transferred,
