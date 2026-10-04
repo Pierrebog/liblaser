@@ -108,18 +108,25 @@
 #define LASER_MAX_RETRIES       6
 #define LASER_RETRY_DELAY_MS    500
 
-/* Spin-up wait budget, far larger than the per-command one but spent once per
- * registration: a cold disc takes seconds to spin up, sometimes more than
- * ten. 30 x 500ms is 15 s while the drive keeps answering "not yet". */
-#define LASER_SPINUP_MAX_ATTEMPTS  30
+/* Delay between two polls of the spin-up wait. */
 #define LASER_SPINUP_DELAY_MS      500
 
-/* Hard ceiling on the real time the spin-up wait may take, whatever the
- * attempt count. The attempt budget assumes near-instant answers; a drive
- * that stops answering without leaving the bus makes each attempt cost two
- * full sets of phase timeouts, turning thirty attempts into minutes - spent
- * under the registry lock, blocking every teardown and registration. */
+/* Ceiling on the real time the spin-up wait may take. Real time rather than a
+ * number of polls: a drive that stops answering without leaving the bus makes
+ * each poll cost two full sets of phase timeouts, and a poll count would then
+ * stretch into minutes - spent under the registry lock, blocking every
+ * teardown and registration. */
 #define LASER_SPINUP_MAX_WALL_MS   15000
+
+/* The ceiling once the drive has answered 04h/01h BECOMING READY: unlike the
+ * other "not ready" answers, that one says the drive is working on it. A
+ * Blu-ray drive behind a 152d:0583 bridge was seen answering it for more than
+ * 15 s while loading a disc just inserted. */
+#define LASER_BECOMING_READY_MAX_WALL_MS 30000
+
+/* UNIT ATTENTIONs retried at once, past the ceilings if need be: see the
+ * wait loop. Bounded against a device that would answer nothing else. */
+#define LASER_SPINUP_MAX_UNIT_ATTENTIONS 4
 
 /* A shorter ceiling, for a drive answering 3Ah with a tray-closed or generic
  * qualifier, counted from the START STOP UNIT. Unlike "becoming ready", that
@@ -436,8 +443,9 @@ static void log_media_status_locked(laser_entry_t *entry)
  *
  * The loop ends early on a tray open (3Ah/02h), which no command closes, and
  * on a device that has left the bus. Other 3Ah answers keep it polling under
- * LASER_NO_MEDIUM_MAX_WALL_MS; everything else under LASER_SPINUP_MAX_WALL_MS
- * and LASER_SPINUP_MAX_ATTEMPTS.
+ * LASER_NO_MEDIUM_MAX_WALL_MS; everything else under LASER_SPINUP_MAX_WALL_MS,
+ * raised to LASER_BECOMING_READY_MAX_WALL_MS once the drive has said it is
+ * becoming ready.
  *
  * Not cancellable. At registration it runs inside laser_acquire(), under
  * g_registry_lock, on an entry not yet published; laser_token_settle() may
@@ -468,14 +476,17 @@ void laser_wait_until_ready(laser_entry_t *entry)
     /* Whether the drive said it was spinning up, for the device-gone report
      * below. */
     int becoming_ready = 0;
+    int unit_attentions = 0;
 
-    for (int attempt = 1; attempt <= LASER_SPINUP_MAX_ATTEMPTS; attempt++) {
+    /* Bounded by the ceilings alone: every path below either returns, sleeps
+     * and meets a ceiling check, or is a UNIT ATTENTION retry, itself
+     * bounded. */
+    for (int attempt = 1; ; attempt++) {
         int rc = test_unit_ready_locked(entry);
 
         if (rc == 0) {
-            LOGI("token=%d: unit ready (attempt %d/%d, %ldms)",
-                 entry->token, attempt, LASER_SPINUP_MAX_ATTEMPTS,
-                 monotonic_ms_since(&started));
+            LOGI("token=%d: unit ready (attempt %d, %ldms)",
+                 entry->token, attempt, monotonic_ms_since(&started));
             entry->not_ready = 0;
             pthread_mutex_unlock(&entry->io_lock);
             return;
@@ -504,9 +515,8 @@ void laser_wait_until_ready(laser_entry_t *entry)
 
         /* Logged raw: 02h/3Ah, 02h/04h/01h and 06h/28h/00h call for different
          * handling, and the messages below do not show which arrived. */
-        LOGI("token=%d: sense %02x/%02x/%02x (attempt %d/%d)",
-             entry->token, sense_key, asc, ascq, attempt,
-             LASER_SPINUP_MAX_ATTEMPTS);
+        LOGI("token=%d: sense %02x/%02x/%02x (attempt %d)",
+             entry->token, sense_key, asc, ascq, attempt);
 
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_BECOMING_READY) {
@@ -516,8 +526,8 @@ void laser_wait_until_ready(laser_entry_t *entry)
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
             if (ascq == SCSI_ASCQ_TRAY_OPEN) {
-                LOGW("token=%d: tray open (attempt %d/%d), giving up wait",
-                     entry->token, attempt, LASER_SPINUP_MAX_ATTEMPTS);
+                LOGW("token=%d: tray open (attempt %d), giving up wait",
+                     entry->token, attempt);
                 log_media_status_locked(entry);
                 pthread_mutex_unlock(&entry->io_lock);
                 return;
@@ -529,20 +539,28 @@ void laser_wait_until_ready(laser_entry_t *entry)
             long no_medium_ms = monotonic_ms_since(&no_medium_since);
             if (no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS) {
                 LOGW("token=%d: still no medium %ldms after START STOP UNIT "
-                     "(attempt %d/%d), giving up wait",
-                     entry->token, no_medium_ms, attempt,
-                     LASER_SPINUP_MAX_ATTEMPTS);
+                     "(attempt %d), giving up wait",
+                     entry->token, no_medium_ms, attempt);
                 log_media_status_locked(entry);
                 pthread_mutex_unlock(&entry->io_lock);
                 return;
             }
 
-            LOGI("token=%d: no medium yet, waiting %dms (attempt %d/%d, "
+            LOGI("token=%d: no medium yet, waiting %dms (attempt %d, "
                  "%ldms of %dms since START STOP UNIT)",
                  entry->token, LASER_SPINUP_DELAY_MS, attempt,
-                 LASER_SPINUP_MAX_ATTEMPTS, no_medium_ms,
-                 LASER_NO_MEDIUM_MAX_WALL_MS);
+                 no_medium_ms, LASER_NO_MEDIUM_MAX_WALL_MS);
             usleep(LASER_SPINUP_DELAY_MS * 1000);
+            continue;
+        }
+
+        /* Cleared by being reported, and most often the drive saying it has
+         * just loaded its medium: the next TEST UNIT READY is the likely
+         * "ready", so it goes out at once - before the ceiling check, which
+         * would otherwise give up on a drive that became ready on the last
+         * round. */
+        if (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
+            ++unit_attentions <= LASER_SPINUP_MAX_UNIT_ATTENTIONS) {
             continue;
         }
 
@@ -550,23 +568,18 @@ void laser_wait_until_ready(laser_entry_t *entry)
          * bounds the time actually spent; after the sense checks, so that an
          * open tray or a missing medium ends the wait on its own terms. */
         long elapsed = monotonic_ms_since(&started);
-        if (elapsed >= LASER_SPINUP_MAX_WALL_MS) {
+        long ceiling = becoming_ready ? LASER_BECOMING_READY_MAX_WALL_MS
+                                      : LASER_SPINUP_MAX_WALL_MS;
+        if (elapsed >= ceiling) {
             LOGW("token=%d: spin-up wall-clock budget exhausted (%ldms over "
                  "%d attempts), proceeding anyway",
                  entry->token, elapsed, attempt);
             break;
         }
 
-        if (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION) {
-            /* Cleared by being reported; retry at once, no delay. */
-            continue;
-        }
-
-        LOGI("token=%d: drive not ready, waiting %dms (attempt %d/%d, %ldms "
-             "of %dms elapsed)",
-             entry->token, LASER_SPINUP_DELAY_MS,
-             attempt, LASER_SPINUP_MAX_ATTEMPTS,
-             elapsed, LASER_SPINUP_MAX_WALL_MS);
+        LOGI("token=%d: drive not ready, waiting %dms (attempt %d, %ldms "
+             "of %ldms elapsed)",
+             entry->token, LASER_SPINUP_DELAY_MS, attempt, elapsed, ceiling);
         usleep(LASER_SPINUP_DELAY_MS * 1000);
     }
 

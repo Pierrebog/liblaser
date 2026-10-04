@@ -215,7 +215,8 @@ int laser_parse_token(const char *str, int *token);
  * kernel driver detached, the Bulk-Only interface found (not assumed to be 0)
  * and claimed, a Mass Storage Reset, the optical logical unit found, and a
  * wait for the drive to spin up. Well under a second on a working drive;
- * seconds on a cold one; at most 15 s on a drive that stops answering.
+ * seconds on a cold one; up to 30 s on one still loading a disc just
+ * inserted; at most 15 s on a drive that stops answering.
  * Registrations are serialized, so a second device's first claim waits
  * behind it. Do not call this from a thread that must stay responsive.
  *
@@ -259,10 +260,11 @@ void laser_release(int token);
  * Whether the drive behind @p token ended its readiness wait without ever
  * answering ready.
  *
- * laser_acquire() waits up to 15 s for the medium, and laser_disc_identify()
- * waits again for a drive found not ready. A drive that never settled in that
- * time answers every later command the same way, each paying its own retry
- * budget to say so; this says it in one lookup and no command.
+ * laser_acquire() waits for the medium - up to 30 s on a drive loading a disc,
+ * 15 s otherwise - and laser_disc_identify() waits again for a drive found not
+ * ready. A drive that never settled in that time answers every later command
+ * the same way, each paying its own retry budget to say so; this says it in
+ * one lookup and no command.
  * laser_disc_identify() checks it for that reason.
  *
  * ADVISORY: registration succeeds either way and nothing is refused because

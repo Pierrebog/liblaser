@@ -293,9 +293,10 @@ void laser_mass_storage_reset(laser_entry_t *entry);
  * answers, and again by laser_token_settle(). Best-effort: a drive that never
  * reports ready is still registered, with laser_entry_t::not_ready left set.
  *
- * Bounded in real time by LASER_SPINUP_MAX_WALL_MS (15 s), reached only by a
- * drive that has stopped answering; it cannot be cancelled. A working drive,
- * loaded or empty, returns within a few seconds. See scsi.c.
+ * Bounded in real time by LASER_SPINUP_MAX_WALL_MS (15 s), raised to
+ * LASER_BECOMING_READY_MAX_WALL_MS (30 s) for a drive that says it is becoming
+ * ready; it cannot be cancelled. A working drive returns within a few seconds,
+ * or within the time it takes to load a disc just inserted. See scsi.c.
  */
 void laser_wait_until_ready(laser_entry_t *entry);
 

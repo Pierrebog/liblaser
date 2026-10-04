@@ -482,8 +482,8 @@ static int laser_register(int fd)
     return -1;
 }
 
-/** Serializes registration - including its slow USB setup, up to fifteen
- * seconds - and teardown, and makes "register if needed, then count the
+/** Serializes registration - including its slow USB setup, up to 30 seconds
+ * for a drive loading a disc - and teardown, and makes "register if needed, then count the
  * claim" one atomic step. Never taken on the transaction path, unlike
  * g_table_lock. */
 static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;

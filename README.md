@@ -50,6 +50,10 @@ commercial one needs [AACS](#7-acronyms). To enable it, you need to:
 - Place `KEYDB.cfg` at `/sdcard/aacs/KEYDB.cfg` and grant VLC *All files
   access* (Android 11 and later).
 
+Most commercial Blu-rays play their main film directly, without menus: their
+menus are written in Java ([BD-J](#7-acronyms)), which VLC cannot run on Android
+(§5).
+
 **Unplugging** is safe at any time: playback stops within a couple of seconds,
 with an error, and the tile disappears.
 
@@ -266,6 +270,15 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
   CSS session exclusion. This is a chantier on the scale of the whole CSS
   effort, not a wiring job, and it is unchanged by the patch below — which
   deliberately touches no MMC code.
+- **Blu-ray menus.** Most commercial discs have [BD-J](#7-acronyms) menus,
+  which libbluray runs on a desktop [JVM](#7-acronyms) loaded from `libjvm.so`
+  — something Android does not have: ART is no such VM, runs dex rather than
+  Java classes, and has no `java.awt`. Such discs play without menus;
+  [HDMV](#7-acronyms) menus are not concerned. Keeping the menus when a disc's
+  entry points are HDMV was tried and abandoned, the first play often jumping
+  to a BD-J title. What remains is shipping an OpenJDK in a separate package,
+  as libaacs is (§2), provided HotSpot can live beside ART, or porting BD-J to
+  ART — both chantiers on the scale of this whole effort.
 
 ### Dormant
 
@@ -387,6 +400,7 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
 | AMG          | Audio Manager. The DVD-Audio zone's `AUDIO_TS.IFO`, identified by its `DVDAUDIO-AMG` magic. |
 | ASC / ASCQ   | Additional Sense Code and its Qualifier. The two bytes that say what a SCSI command actually failed on; the sense key alone rarely does. |
 | BBB          | Bulk/Bulk/Bulk. The USB Mass Storage specification's own name for Bulk-Only Transport, and the reason its protocol code is what it is. |
+| BD-J         | Blu-ray Disc Java. Menus and applications written as Java programs (Xlets) stored on the disc, run by libbluray on a Java VM. |
 | BOT          | Bulk-Only Transport. The USB Mass Storage transport this library speaks, and what `bot.c` is named after. |
 | CBW / CSW    | Command Block Wrapper and Command Status Wrapper. The header that carries a CDB out and the trailer that reports what happened, one pair per transaction. |
 | CDB          | Command Descriptor Block. The SCSI command itself, 6 to 16 bytes, riding inside a CBW. |
@@ -395,7 +409,9 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
 | CPXM         | CPPM and CPRM taken together — the name the libdvdcss fork uses for the implementation behind `dvdcpxm.h`. |
 | CSS          | Content Scramble System. DVD-Video's protection. Nothing to do with stylesheets. |
 | EDC / ECC    | Error Detection Code and Error Correction Code. The trailer on a raw CD sector, and the reason a raw read can come back 2072 or 2348 bytes instead of 2352. |
+| HDMV         | High Definition Movie mode. Blu-ray's command-based menus and navigation, interpreted by libbluray itself without Java. |
 | IFO          | The DVD "information" file extension — `VIDEO_TS.IFO` and friends, unscrambled even on a protected disc. |
+| JVM          | Java Virtual Machine. Here the desktop one libbluray loads from `libjvm.so`, which Android's ART is not. |
 | LBA          | Logical Block Address. A sector number, counted from the start of the medium unless something says otherwise. |
 | LUN          | Logical Unit Number. Which unit behind one USB device a command is addressed to; an optical drive is rarely LUN 0 on a multi-slot bridge. |
 | MMC          | Multi-Media Commands. The SCSI command set for optical drives. Not MultiMediaCard, which is a different thing entirely. |
