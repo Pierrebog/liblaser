@@ -312,6 +312,39 @@ static int start_stop_unit_locked(laser_entry_t *entry,
     return csw_status;
 }
 
+/* PREVENT ALLOW MEDIUM REMOVAL (opcode 1Eh) with Prevent = 00b: unlock the
+ * tray. See laser_internal.h. */
+void laser_allow_medium_removal(laser_entry_t *entry)
+{
+    uint8_t cdb[6] = { 0 };
+    cdb[0] = 0x1e;  /* PREVENT ALLOW MEDIUM REMOVAL; byte 4 = 0: allow */
+
+    pthread_mutex_lock(&entry->io_lock);
+
+    int csw_status = -1;
+    int rc = laser_bot_send_locked(entry, cdb, sizeof(cdb),
+                                   NULL, 0, 0, NULL, &csw_status);
+
+    uint8_t sense_key = 0xff, asc = 0, ascq = 0;
+    if (rc != 0 && csw_status == USB_BOT_STATUS_FAIL) {
+        request_sense_locked(entry, &sense_key, &asc, &ascq);
+    }
+
+    pthread_mutex_unlock(&entry->io_lock);
+
+    /* Not fatal either way: a drive that refuses still plays, its tray is
+     * just left as the kernel left it. */
+    if (rc == 0) {
+        LOGI("token=%d: tray unlocked (PREVENT ALLOW MEDIUM REMOVAL, allow)",
+             entry->token);
+    } else {
+        LOGW("token=%d: PREVENT ALLOW MEDIUM REMOVAL refused (rc=%d csw=%d "
+             "sense %02x/%02x/%02x) - the tray may stay locked until the "
+             "drive is unplugged",
+             entry->token, rc, csw_status, sense_key, asc, ascq);
+    }
+}
+
 /* Tell the drive to load and spin its medium up, escalating through the
  * shapes a bridge might accept.
  *

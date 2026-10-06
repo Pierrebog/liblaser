@@ -444,6 +444,10 @@ static int laser_register(int fd)
         goto err_iface;
     }
 
+    /* The detached kernel driver may have left the tray locked. */
+    if (entry->kernel_driver_detached)
+        laser_allow_medium_removal(entry);
+
     /* Some firmware fails a READ that arrives before spin-up instead of
      * starting it, so wait before anything reads. */
     laser_wait_until_ready(entry);

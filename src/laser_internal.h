@@ -288,6 +288,17 @@ int laser_find_bulk_endpoints(laser_entry_t *entry);
 void laser_mass_storage_reset(laser_entry_t *entry);
 
 /**
+ * Unlock the tray: PREVENT ALLOW MEDIUM REMOVAL with Prevent = 00b.
+ *
+ * Linux's sr driver locks the tray while the disc is mounted, and unlocks it
+ * on unmount. Once registration has detached that driver, its unlock can no
+ * longer reach the drive, and the lock - held by the drive's firmware - would
+ * outlive VLC until the drive is unplugged. Called at registration when the
+ * kernel driver was detached. Best-effort; takes entry->io_lock.
+ */
+void laser_allow_medium_removal(laser_entry_t *entry);
+
+/**
  * Wake the drive and wait for its medium to become ready, before any read.
  * Called at registration, after laser_probe_lun() has found a unit that
  * answers, and again by laser_token_settle(). Best-effort: a drive that never
