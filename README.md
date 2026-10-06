@@ -163,10 +163,9 @@ which of the three paths above is taken:
 
 | MRL                                                                                      | Purpose                                                                                                                                                                                                                                                                                                  |
 |------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `file://laser/<fd>`                                                                      | Classification. The `file` scheme is borrowed because the preparser types items from a fixed scheme table and never opens a module for a scheme it does not know.                                                                                                                                        |
+| `laser-dir://<fd>`                                                                       | Classification. A shortcut of its own, because a playback MRL reaches the access as `laser://<fd>` and the access cannot tell a listing from a byte stream by the location alone.                                                                                                                        |
 | `laser/dvd://<fd>`, `laser/dvdsimple://<fd>`, `laser/dvda://<fd>`, `laser/bluray://<fd>` | Video and DVD-Audio playback. libVLC reads this as access `laser` plus a demuxer name. A DVD-Video is offered under two of them — with menus and without — and a universal disc under `dvda` and `dvd`, one per zone, told apart by their icon alone.                                                    |
-| `cdda://laser/<fd>`                                                                      | CD-Audio. Here the drive is the URI's *authority*, not the access module: `cdda` is an access_demux and reaches the contrib itself. It expands into one MRL per track, `…/Track%20NN`.                                                                                                                   |
-| `vcd://laser/<fd>`, `svcd://laser/<fd>`                                                  | Video CD and Super Video CD. Same shape and same reason as the line above — the drive is the authority, and `vcd` reaches the contrib through the same `cdrom.c` as `cdda`. A Video CD is a *video* disc that stays on the *CD* path, because what decides the path is the sector, not the content.      |
+| `cdda://laser/<fd>`, `vcd://laser/<fd>`, `svcd://laser/<fd>`                             | CD-Audio, Video CD and Super Video CD, read as raw CD sectors: the drive is the URI's *authority*, and `cdda` or `vcd` reaches the contrib through `cdrom.c`. CD-Audio expands into one MRL per track, `…/Track%20NN`. A Video CD is video yet takes this path: the sector decides.                      |
 
 Two asymmetries in the diagram are worth reading twice. The `dvd` and `bluray`
 demuxers get their **blocks** from the access module, not from the contrib —
@@ -228,7 +227,7 @@ paths —
 and at `scsi.c` for its key commands, every one of which goes through the
 single `LaserSend()` wrapper in `ioctl.c`. Nothing enters at `bot.c` or below.
 
-**Two libraries a reader will look for are deliberately absent.** libbluray
+**Two libraries are deliberately absent.** libbluray
 takes its blocks from the access module's stream and needs no token, as §4
 already says. libaacs has no edge either, for a different reason: its Android
 patch is `dirs_android.c` alone, which decides where `KEYDB.cfg` is read from
