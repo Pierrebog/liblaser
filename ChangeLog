@@ -1,3 +1,9 @@
+2026-10-06: Version 0.2.1
+    - Switch to meson build system
+    - Add laser_parse_token helper function to extract the FD off a MRL
+    - Return LASER_ERR_INVALID rather than LASER_ERR_IO for caller bugs
+    - Bug fixes
+
 2026-09-19: Version 0.2
     - Rework of the interface between liblaser and the laser module - breaks compatibility with v0.1
     - Working support for VCD, DVD-Audio and Blu-ray
