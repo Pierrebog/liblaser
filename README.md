@@ -17,11 +17,12 @@ sending [SCSI](#7-acronyms) command blocks over USB bulk endpoints itself.
 
 ### How to use
 
-*This assumes you use a **VLC for Android** buid that includes this library and
-where all the related patches to libdvdcss, libvlc and vlc-android have been applied.*
+*This assumes you use a **VLC for Android** build that includes this library and
+where all the related patches to libdvdcss, libdvdread, libdvdnav, libvlc and
+vlc-android have been applied.*
 
-**Play a disc.** Plug the drive in, grant the USB permission Android asks for,
-and open *Browse*. A tile appears per disc found, named after the disc. Tap it.
+**Play a disc.** Open the *Browse* tab, plug the drive in and grant the USB permission
+Android asks for. A tile appears per disc found, named after the disc. Tap it.
 
 **Several drives at once** each get their own tile, or tiles. Android asks a
 separate permission per drive, one dialog after the other, and the tiles keep
@@ -35,8 +36,8 @@ launches.
 many are labelled simply *VIDEOCD*, which is the label the disc itself carries.
 
 **DVD-Video discs** offer two tiles. One with the disc's own menus, one labelled
-*(No menus)* that starts the first title directly. Use the second when a
-disc's menus do not respond, or to skip straight to the film.
+*(No disc menus)* that starts the first title directly. Use the second when a
+disc's menus do not respond, or to skip straight to the main feature.
 
 **DVD-Audio discs** appear as one tile. Most of them are *universal* discs
 carrying a video version of the same album alongside the audio one, and those
@@ -59,8 +60,8 @@ with an error, and the tile disappears.
 
 ### Troubleshooting
 
-**In case of low DVD framerate,** especially on older arm setup, set hardware
-acceleration to `Disabled` or `Automatic`.
+**In case of stuttering DVD playback,** especially on older ARM devices, set hardware
+acceleration to `Automatic` or `Disabled`.
 
 **If nothing happens when you plug the drive in** — no permission dialog, no
 tile — the usual cause is power rather than software. An optical drive draws
@@ -87,17 +88,16 @@ device in a small registry. No parallel handle type, no registration call from
 the Java side, no lifecycle to keep in sync. It stays an ordinary argument the
 whole way down: each library between the MRL and the transport takes it as the
 target of its open call, so nothing carries it out of band. The cost is that the token is
-meaningful only within one process and one connection, which makes an
+meaningful only within one process and one connection, which makes a
 laser MRL a *session-scoped* name: it may never enter a persistent store,
 and the connection behind it needs an owner that outlives the screen that
-opened it. Both are handled.
+opened it.
 
 **One shared contrib, not per-module code.** `liblaser` owns the
 device registry (`registry.c`), the USB interface and endpoint discovery
 (`usb.c`), the Mass Storage Bulk-Only transport (`bot.c`), the SCSI command
 layer (`scsi.c`) and the identification of the disc in the drive (`disc.c`) —
-one file per concern, since the three transport ones started life as a single
-one and the split follows the boundaries its own header comment already named.
+one file per concern.
 The VLC access module, libdvdcss, libdvdread/libdvdnav and the CD-Audio module
 all reach the drive through it. Retry policy, [LUN](#7-acronyms) selection, sense-code
 interpretation and error semantics exist once. libbluray is the one consumer
@@ -111,7 +111,7 @@ descriptor instead of assuming interface 0; `GET MAX LUN` stalling is treated
 as the class specification says it must be; transfer size is negotiated
 downwards at runtime instead of being fixed at a value safe for the worst
 bridge. Per-device workarounds remain possible — every log line carries
-`vid:pid:bcd` — but none has been needed.
+`vid:pid:bcd` — but none has been needed so far.
 
 **VLC's architecture is the frame, not an obstacle.** Everything here is an
 ordinary module with a capability and a shortcut, selected by an ordinary MRL
@@ -120,10 +120,10 @@ short-circuits libVLC to reach the Java side: **this project adds no new JNI
 call at all.** The constraint is load-bearing — the fd travels inside an MRL
 because an MRL is a string libVLC already carries end to end, and the
 connection's lifetime is reconciled from events libVLC already emits. It
-also decides what does *not* get written: where a behaviour was missing it was
+also decides what does *not* get written: where a behaviour is missing it is
 added in the shape VLC already uses, in the module that owns it, rather than
 routed around from outside — hence the small, local patches to `cdda.c`,
-`dvdread.c`, libdvdcss, libdvdread and libdvdnav.
+`dvdread.c`, `libdvdcss`, `libdvdread` and `libdvdnav`.
 
 ## 4. Architecture
 
@@ -141,7 +141,7 @@ routed around from outside — hence the small, local patches to `cdda.c`,
   ┌────────────────┐   ┌──────────────────┐  ┌─────────────────┐
   │    access      │   │     demux        │  │  access_demux   │
   │    "laser"     │   │ dvd / dvdsimple  │  │     "cdda"      │
-  │                │◄──│  dvda / bluray   │  │  access "vcd"   │
+  │  "laser-dir"   │◄──│  dvda / bluray   │  │  access "vcd"   │
   │                │   │                  │  │    / "svcd"     │
   └────────────────┘   └──────────────────┘  └─────────────────┘
   lists the disc,      blocks: from the      raw CD sectors,
@@ -167,22 +167,8 @@ which of the three paths above is taken:
 | `laser/dvd://<fd>`, `laser/dvdsimple://<fd>`, `laser/dvda://<fd>`, `laser/bluray://<fd>` | Video and DVD-Audio playback. libVLC reads this as access `laser` plus a demuxer name. A DVD-Video is offered under two of them — with menus and without — and a universal disc under `dvda` and `dvd`, one per zone, told apart by their icon alone.                                                    |
 | `cdda://laser/<fd>`, `vcd://laser/<fd>`, `svcd://laser/<fd>`                             | CD-Audio, Video CD and Super Video CD, read as raw CD sectors: the drive is the URI's *authority*, and `cdda` or `vcd` reaches the contrib through `cdrom.c`. CD-Audio expands into one MRL per track, `…/Track%20NN`. A Video CD is video yet takes this path: the sector decides.                      |
 
-Two asymmetries in the diagram are worth reading twice. The `dvd` and `bluray`
-demuxers get their **blocks** from the access module, not from the contrib —
-which is why libbluray needs no token at all, and why only libdvdcss, for its
-key commands, has an arrow going down. And the right-hand column never touches
-*our* access module at all: `cdda`, `vcd` and `svcd` are VLC's own, and they
-reach the drive through `cdrom.c`, which the contrib serves directly.
-
-What puts a disc in that right-hand column is the **sector**, not the medium.
-A stream hands out a flat run of 2048-byte blocks; CD-Audio is 2352-byte raw
-sectors and a Video CD's payload is Mode 2 Form 2 — 2324 usable bytes behind a
-24-byte header — and neither can be expressed that way. So a Video CD, despite
-being video, sits beside the audio CD rather than beside the DVD.
 
 ### Inside the contrib
-
-§3 names the five files and what each owns. This is how they reach each other.
 
 ```
   consumers, out of tree:  VLC access "laser" · cdrom.c · libdvdcss
@@ -228,8 +214,8 @@ and at `scsi.c` for its key commands, every one of which goes through the
 single `LaserSend()` wrapper in `ioctl.c`. Nothing enters at `bot.c` or below.
 
 **Two libraries are deliberately absent.** libbluray
-takes its blocks from the access module's stream and needs no token, as §4
-already says. libaacs has no edge either, for a different reason: its Android
+takes its blocks from the access module's stream and needs no token.
+libaacs has no edge either, for a different reason: its Android
 patch is `dirs_android.c` alone, which decides where `KEYDB.cfg` is read from
 and where the key cache is written — a storage-location problem that exists on
 Android whether or not a USB drive is involved, and one that touches no [MMC](#7-acronyms)
@@ -266,9 +252,7 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
   MMC commands of its own — the Volume ID above all — which a stream cannot
   carry. Making those discs play means giving libaacs the treatment libdvdcss
   got: a device handle routed through the contrib, plus the equivalent of the
-  CSS session exclusion. This is a chantier on the scale of the whole CSS
-  effort, not a wiring job, and it is unchanged by the patch below — which
-  deliberately touches no MMC code.
+  CSS session exclusion.
 - **Blu-ray menus.** Most commercial discs have [BD-J](#7-acronyms) menus,
   which libbluray runs on a desktop [JVM](#7-acronyms) loaded from `libjvm.so`
   — something Android does not have: ART is no such VM, runs dex rather than
@@ -277,7 +261,8 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
   entry points are HDMV was tried and abandoned, the first play often jumping
   to a BD-J title. What remains is shipping an OpenJDK in a separate package,
   as libaacs is (§2), provided HotSpot can live beside ART, or porting BD-J to
-  ART — both chantiers on the scale of this whole effort.
+  ART — both undertakings on the scale of this whole effort, and not on the
+  table.
 
 ### Dormant
 
