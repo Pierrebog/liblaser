@@ -81,9 +81,10 @@
 #define SCSI_ASCQ_CP_REGION_MISMATCH    0x04
 #define SCSI_ASCQ_CP_REGION_PERMANENT   0x05
 
-/* 04h: not ready, 04h/01h being "becoming ready". Not a branch of its own in
- * the spin-up wait, only recorded: a drive that leaves the bus right after
- * saying it was drawing spindle current. */
+/* 04h: not ready, 04h/01h being "becoming ready". In the spin-up wait it
+ * raises the ceiling and is recorded: a drive that leaves the bus right after
+ * saying it was drawing spindle current. In laser_scsi_cdb() it is waited
+ * out rather than retried. */
 #define SCSI_ASC_BECOMING_READY         0x04
 
 #define SCSI_ASC_MEDIUM_NOT_PRESENT     0x3a
@@ -121,7 +122,8 @@
 /* The ceiling once the drive has answered 04h/01h BECOMING READY: unlike the
  * other "not ready" answers, that one says the drive is working on it. A
  * Blu-ray drive behind a 152d:0583 bridge was seen answering it for more than
- * 15 s while loading a disc just inserted. */
+ * 15 s while loading a disc just inserted. Also the ceiling of a command
+ * answered it, counted from that answer. */
 #define LASER_BECOMING_READY_MAX_WALL_MS 30000
 
 /* UNIT ATTENTIONs retried at once, past the ceilings if need be: see the
@@ -919,6 +921,10 @@ laser_status_t laser_scsi_cdb(int token,
      * verdict after the loop. */
     int cbw_never_sent = 0;
 
+    /* Set by the first 04h/01h BECOMING READY: see its branch below. */
+    int becoming_ready = 0;
+    struct timespec becoming_ready_since;
+
     for (int attempt = 1; attempt <= LASER_MAX_RETRIES; attempt++) {
         attempts_made = attempt;
 
@@ -983,9 +989,9 @@ laser_status_t laser_scsi_cdb(int token,
         }
 
         /* Disc gone or swapped: never retried, so that an ejection is felt at
-         * once. Every 3Ah qualifier, unlike in the spin-up wait: that wait is
-         * the only place that waits, and it has already run, so a fresh 3Ah
-         * here means the disc really is gone. */
+         * once. Every 3Ah qualifier, unlike in the spin-up wait: that wait
+         * has already run, so a fresh 3Ah here means the disc really is
+         * gone. */
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
             LOGW("token=%d: no disc present (%02x/%02x/%02x), not retrying",
@@ -995,6 +1001,19 @@ laser_status_t laser_scsi_cdb(int token,
         }
         if (asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
             ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) {
+            /* Right after the drive said it was becoming ready - to this
+             * command, or to a spin-up wait that gave up - this is the NOT
+             * READY TO READY change that ends a spin-up, not a disc swap.
+             * Retried at once, without spending an attempt; once only, since
+             * both flags are cleared. */
+            if (becoming_ready || entry->not_ready) {
+                LOGI("token=%d: drive now ready (06/28/00 after spin-up), "
+                     "retrying cdb 0x%02x", token, cdb[0]);
+                becoming_ready = 0;
+                entry->not_ready = 0;
+                attempt--;
+                continue;
+            }
             LOGW("token=%d: medium may have changed, not retrying", token);
             result = LASER_ERR_MEDIA_GONE;
             break;
@@ -1066,6 +1085,28 @@ laser_status_t laser_scsi_cdb(int token,
             reason_logged = 1;
             result = LASER_ERR_IO;
             break;
+        }
+
+        /* A drive waking from standby answers "becoming ready" far longer
+         * than LASER_MAX_RETRIES covers: a Blu-ray drive idle for a few
+         * minutes took 45 s, past the spin-up wait at registration. Waited
+         * out under LASER_BECOMING_READY_MAX_WALL_MS, without spending
+         * attempts; cancellation is still checked on every round. */
+        if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
+            asc == SCSI_ASC_BECOMING_READY) {
+            if (!becoming_ready) {
+                becoming_ready = 1;
+                clock_gettime(CLOCK_MONOTONIC, &becoming_ready_since);
+                LOGI("token=%d: cdb 0x%02x: drive becoming ready, waiting up "
+                     "to %dms", token, cdb[0],
+                     LASER_BECOMING_READY_MAX_WALL_MS);
+            }
+            if (monotonic_ms_since(&becoming_ready_since) <
+                LASER_BECOMING_READY_MAX_WALL_MS) {
+                attempt--;
+                usleep(LASER_RETRY_DELAY_MS * 1000);
+                continue;
+            }
         }
 
         if (asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
