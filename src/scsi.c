@@ -366,9 +366,11 @@ void laser_allow_medium_removal(laser_entry_t *entry)
  *       reported: a 152d:0583 bridge answers 06h/29h to the first command
  *       after power-on. Its second answer goes down the ladder below.
  *   2a. 05h/20h INVALID OPCODE: stop. Every other shape is the same opcode.
- *   2b. 05h/24h INVALID FIELD IN CDB: retry without IMMED, the field ATAPI
+ *   2b. 02h/04h NOT READY, BECOMING READY: stop. The drive is already
+ *       loading, and the caller's wait covers that.
+ *   2c. 05h/24h INVALID FIELD IN CDB: retry without IMMED, the field ATAPI
  *       bridges most often lack. This one may block for the whole spin-up.
- *   2c. anything else: retry with LOEJ, "load the medium" being a different
+ *   2d. anything else: retry with LOEJ, "load the medium" being a different
  *       request from "spin what you have". A 05h/24h answer to that names
  *       LOEJ, so the ladder ends there: a drive with no motorised load
  *       refuses it with or without IMMED, as a 152d:0583 bridge showed.
@@ -398,6 +400,13 @@ static void spin_up_locked(laser_entry_t *entry)
         asc == SCSI_ASC_INVALID_OPCODE) {
         LOGW("token=%d: drive does not implement START STOP UNIT - nothing "
              "here can ask it to load a medium", entry->token);
+        return;
+    }
+
+    if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
+        asc == SCSI_ASC_BECOMING_READY) {
+        LOGI("token=%d: drive already becoming ready, no further START STOP "
+             "UNIT", entry->token);
         return;
     }
 
