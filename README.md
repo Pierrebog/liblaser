@@ -36,7 +36,7 @@ launches.
 many are labelled simply *VIDEOCD*, which is the label the disc itself carries.
 
 **DVD-Video discs** offer two tiles. One with the disc's own menus, one labelled
-*(No disc menus)* that starts the first title directly. Use the second when a
+*(No menus)* that starts the first title directly. Use the second when a
 disc's menus do not respond, or to skip straight to the main feature.
 
 **DVD-Audio discs** appear as one tile. Most of them are *universal* discs
@@ -379,22 +379,14 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
 | Acronym      | Meaning |
 | ------------ | ------- |
 | AACS         | Advanced Access Content System. Blu-ray's content protection, implemented by libaacs. |
-| ABI          | Application Binary Interface. Which machine code an Android device will load. |
-| AGID         | Authentication Grant ID. The handle a drive issues for one CSS handshake; a drive has four and leaks them if a request is retried. |
-| AMG          | Audio Manager. The DVD-Audio zone's `AUDIO_TS.IFO`, identified by its `DVDAUDIO-AMG` magic. |
 | ASC / ASCQ   | Additional Sense Code and its Qualifier. The two bytes that say what a SCSI command actually failed on; the sense key alone rarely does. |
 | BBB          | Bulk/Bulk/Bulk. The USB Mass Storage specification's own name for Bulk-Only Transport, and the reason its protocol code is what it is. |
 | BD-J         | Blu-ray Disc Java. Menus and applications written as Java programs (Xlets) stored on the disc, run by libbluray on a Java VM. |
 | BOT          | Bulk-Only Transport. The USB Mass Storage transport this library speaks, and what `bot.c` is named after. |
 | CBW / CSW    | Command Block Wrapper and Command Status Wrapper. The header that carries a CDB out and the trailer that reports what happened, one pair per transaction. |
 | CDB          | Command Descriptor Block. The SCSI command itself, 6 to 16 bytes, riding inside a CBW. |
-| CD-DA        | Compact Disc Digital Audio. Red Book audio: no filesystem, hence no volume label. |
-| CPPM         | Content Protection for Prerecorded Media. DVD-Audio's scheme, and unlike CSS it adds no SCSI command. |
-| CPXM         | CPPM and CPRM taken together — the name the libdvdcss fork uses for the implementation behind `dvdcpxm.h`. |
 | CSS          | Content Scramble System. DVD-Video's protection. Nothing to do with stylesheets. |
-| EDC / ECC    | Error Detection Code and Error Correction Code. The trailer on a raw CD sector, and the reason a raw read can come back 2072 or 2348 bytes instead of 2352. |
 | HDMV         | High Definition Movie mode. Blu-ray's command-based menus and navigation, interpreted by libbluray itself without Java. |
-| IFO          | The DVD "information" file extension — `VIDEO_TS.IFO` and friends, unscrambled even on a protected disc. |
 | JVM          | Java Virtual Machine. Here the desktop one libbluray loads from `libjvm.so`, which Android's ART is not. |
 | LBA          | Logical Block Address. A sector number, counted from the start of the medium unless something says otherwise. |
 | LUN          | Logical Unit Number. Which unit behind one USB device a command is addressed to; an optical drive is rarely LUN 0 on a multi-slot bridge. |
@@ -403,13 +395,10 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
 | OSTA         | Optical Storage Technology Association. Publishes UDF. |
 | PTP / OTP    | Parallel Track Path and Opposite Track Path. Which direction the second layer of a dual-layer DVD is read in. |
 | PVD          | Primary Volume Descriptor. ISO9660's volume header, holding the root directory record, at sector 16 of the track carrying the filesystem. |
-| RPC          | Region Playback Control. RPC-1 names a drive that enforces no region itself. |
 | SBC / SPC    | SCSI Block Commands and SCSI Primary Commands. The two command sets MMC sits on top of. |
 | SCSI         | Small Computer System Interface. The command language, still spoken by every optical drive whatever it is plugged into. |
 | T10 / INCITS | The technical committee that publishes the SCSI standards, and the body it belongs to. |
 | TOC          | Table of Contents. A CD's track list, read with one command. Drives make one up for a DVD or a BD, so it says what a CD holds, not whether the medium is one. |
 | UDF          | Universal Disk Format. The filesystem on every DVD and Blu-ray, and the one libdvdread actually reads. |
 | VCD / SVCD   | Video CD and Super Video CD. MPEG-1 and MPEG-2 video on a CD, read through ISO9660. |
-| VMG          | Video Manager. The DVD-Video zone's `VIDEO_TS.IFO`, identified by its `DVDVIDEO-VMG` magic. |
-| VOB          | Video Object. A DVD-Video payload file, and the part of the disc that is scrambled. |
 | VUK          | Volume Unique Key. The per-disc key AACS derives before anything can be decrypted. |
